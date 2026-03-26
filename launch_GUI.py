@@ -45,13 +45,13 @@ pressure_tab.start_timer(title=gas_flowrate_plot_title, interval_ms=interval_tim
 
 #pressure tab controls
 pressure_tab.add_dropdown_menu(title='Pressure log increment', option_names=['2s', '10s', '1m', '10m', '1hr'], option_values=[2, 10, 60, 600, 600*6], ctrl_var='Log Outer Vessel Pressure', on_change_callback=pressure_tab.change_pressure_or_flowrate_cmd)
-pressure_tab.add_command_button(title='Log Outer Vessel Pressure', command=f'.venv\Scripts\python.exe log_pressure.py {outer_vessel_pressure_log_filepath} COM3 2')
+pressure_tab.add_command_button(title='Log Outer Vessel Pressure', command=f'.venv/Scripts/python.exe log_pressure.py {outer_vessel_pressure_log_filepath} COM3 2')
 
 pressure_tab.add_dropdown_menu(title='Gas flowrate log increment', option_names=['2s', '10s', '1m', '10m', '1hr'], option_values=[2, 10, 60, 600, 600*6], ctrl_var='Log Gas Flowrate', on_change_callback=pressure_tab.change_pressure_or_flowrate_cmd)
-pressure_tab.add_command_button(title='Log Gas Flowrate', command=f'.venv\Scripts\python.exe log_gas_flowrate.py {gas_flow_log_filepath} COM5 2')
+pressure_tab.add_command_button(title='Log Gas Flowrate', command=f'.venv/Scripts/python.exe log_gas_flowrate.py {gas_flow_log_filepath} COM5 2')
 
 pressure_tab.add_dropdown_menu(title='Gas Flowrate Setting', option_names=['0%', '5%', '25%', '50%', '75%', '100%'], option_values=[0, 5, 25, 50, 75, 100], ctrl_var='Change Gas Flowrate', on_change_callback=pressure_tab.change_pressure_or_flowrate_cmd)
-pressure_tab.add_command_button(title='Change Gas Flowrate', command=f'.venv\Scripts\python.exe change_gas_flowrate.py COM5 0')
+pressure_tab.add_command_button(title='Change Gas Flowrate', command=f'.venv/Scripts/python.exe change_gas_flowrate.py COM5 0')
 
 pressure_ctrl_titles = [inner_vessel_plot_title, outer_vessel_plot_title, both_vessels_plot_title, gas_flowrate_plot_title]
 pressure_tab.add_dropdown_menu(title='# data points shown', option_names=['10', '50', '100', '1000', '10000', '100000'], option_values=[10, 50, 100, 1000, 10000, 100000], ctrl_var=pressure_ctrl_titles, on_change_callback=pressure_tab.change_buffer_size_multiple)
