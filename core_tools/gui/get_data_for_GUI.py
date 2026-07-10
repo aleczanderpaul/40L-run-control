@@ -106,54 +106,6 @@ def get_seconds_ago(dataframe):
     # Return the new 'seconds_ago' Series from the dataframe
     return dataframe['seconds_ago']
 
-''' #deprecated since we want to plot both gauges simultaneously
-def get_outer_vessel_pressure(dataframe):
-    # Convert gauge values to numeric, coercing errors (like 'Off') to NaN
-    gauge1 = pd.to_numeric(dataframe['Gauge 1'], errors='coerce')
-    gauge2 = pd.to_numeric(dataframe['Gauge 2'], errors='coerce')
-
-    # Identify rows where one gauge is on (not NaN) and the other is off (NaN)
-    g1_On_g2_Off_indices = np.where(~gauge1.isna() & gauge2.isna())[0]
-    g1_Off_g2_On_indices = np.where(gauge1.isna() & ~gauge2.isna())[0]
-
-    # Identify rows where one gauge is positive and the other is negative
-    g1_pos_g2_neg_indices = np.where((gauge1 > 0.0) & (gauge2 <= 0.0))[0]
-    g1_neg_g2_pos_indices = np.where((gauge1 <= 0.0) & (gauge2 > 0.0))[0]
-
-    #Identify rows where both gauges read a positive number
-    g1_pos_g2_pos_indices = np.where((gauge1 > 0.0) & (gauge2 > 0.0))[0]
-
-    # Initialize the pressure array with NaN for all rows, rows not filled later mean no valid pressure reading
-    pressure = np.full(len(dataframe), np.nan)
-
-    # Assign pressure values based on the gauge states
-    pressure[g1_On_g2_Off_indices] = gauge1[g1_On_g2_Off_indices]
-    pressure[g1_Off_g2_On_indices] = gauge2[g1_Off_g2_On_indices]
-
-    pressure[g1_pos_g2_neg_indices] = gauge1[g1_pos_g2_neg_indices]
-    pressure[g1_neg_g2_pos_indices] = gauge2[g1_neg_g2_pos_indices]
-
-    pressure[g1_pos_g2_pos_indices] = gauge1[g1_pos_g2_pos_indices]
-    #pressure[g1_pos_g2_pos_indices] = np.minimum(gauge1[g1_pos_g2_pos_indices], gauge2[g1_pos_g2_pos_indices])
-
-    #Invalidate pressure if units are off
-    units = dataframe['Units']
-
-    units_not_valid_indices = np.where(units == 'Off')[0]
-
-    pressure[units_not_valid_indices] = np.nan
-
-    #Convert to Torr
-    units_Pascal_indices = np.where(units == 'Pascal')[0]
-    pressure[units_Pascal_indices] = pressure[units_Pascal_indices] * 0.0075006168
-
-    units_Bar_indices = np.where(units == 'Bar')[0]
-    pressure[units_Bar_indices] = pressure[units_Bar_indices] * 750.06
-
-    # Return the pressure values as a pandas Series with the same index as the input DataFrame
-    return pd.Series(pressure, name='Pressure', index=dataframe.index)
-'''
-
 def get_outer_vessel_gauge_pressure(dataframe, gauge_num):
     # Convert gauge values to numeric, coercing errors (like 'Off') to NaN
     gauge = pd.to_numeric(dataframe[f'Gauge {gauge_num}'], errors='coerce')

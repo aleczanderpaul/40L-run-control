@@ -6,7 +6,7 @@ from core_tools.flowrate.save_gas_flow_readings_functions import create_flow_log
 #Create the CSV files for logging data BEFORE adding the relevant plot to the GUI window because the plotter will look for the file when it is created. Use the create_X_log_csv functions to create the files.
 #Do NOT use any filenames with whitespaces in them, as this will cause issues with the terminal command buttons.
 #The widgets (plots, buttons, etc.) are added to the GUI window in the order they are written here and fill from left to right, top to bottom.
-#For more infromation on how to use the LivePlotter class, see GitHub readme file or the source code at core_tools/gui/live_plotter_GUI_class.py
+#For more infromation on how to use the LivePlotter class, see source code at core_tools/gui/live_plotter_GUI_class.py
 
 plotter = LivePlotter("40L Run Control")
 
