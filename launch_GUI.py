@@ -8,16 +8,18 @@ from core_tools.flowrate.save_gas_flow_readings_functions import create_flow_log
 #The widgets (plots, buttons, etc.) are added to the GUI window in the order they are written here and fill from left to right, top to bottom.
 #For more infromation on how to use the LivePlotter class, see GitHub readme file or the source code at core_tools/gui/live_plotter_GUI_class.py
 
-plotter = LivePlotter("Test Live Plotter")
+plotter = LivePlotter("40L Run Control")
 
 outer_vessel_pressure_log_filepath = 'outer_vessel_pressure_log.csv'
 inner_vessel_pressure_log_filepath = 'inner_vessel_pressure_log.csv'
 gas_flow_log_filepath = 'gas_flow_log.csv'
+vmm_temperatures_log_filepath = 'vmm_temperatures.csv'
 
 inner_vessel_pressure_offset = 9.16837220249
 outer_vessel_pressure_g1_offset = 0
 outer_vessel_pressure_g2_offset = 0
 gas_flow_offset = 0
+vmm_temperatures_offset = 0
 
 create_pressure_log_csv(outer_vessel_pressure_log_filepath)
 create_flow_log_csv(gas_flow_log_filepath)
@@ -59,14 +61,13 @@ pressure_tab.add_dropdown_menu(title='# data points shown', option_names=['10', 
 
 pressure_tab.cmd_timer(100)
 
-'''temp_tab = plotter.create_tab(tab_name='Temperature', plots_per_row=4)
-num_vmms = 32
+temp_tab = plotter.create_tab(tab_name='Temperature', plots_per_row=4)
+num_vmms = 16
 temp_ctrl_titles = []
 for i in range(0, num_vmms):
-    temp_tab.add_plot(title=f'Plot VMM {i} Temperature', x_axis=('Time since present', 's'), y_axis=('Temperature', 'deg C'), buffer_size=10, csv_filepaths=[pressure_log_filepath], datatypes=['outer_vessel_pressure'])
+    temp_tab.add_plot(title=f'Plot VMM {i} Temperature', x_axis=('Time since present', 's'), y_axis=('Temperature', 'deg C'), offset=[vmm_temperatures_offset], buffer_size=10, csv_filepaths=[vmm_temperatures_log_filepath], datatypes=['temperature'], vmm_nums=[i])
     temp_tab.start_timer(title=f'Plot VMM {i} Temperature', interval_ms=interval_time_ms)
     temp_ctrl_titles.append(f'Plot VMM {i} Temperature')
 temp_tab.add_dropdown_menu(title='# data points shown', option_names=['10', '50', '100', '1000', '10000'], option_values=[10, 50, 100, 1000, 10000], ctrl_var=temp_ctrl_titles, on_change_callback=temp_tab.change_buffer_size_multiple)
-'''
 
 plotter.run()

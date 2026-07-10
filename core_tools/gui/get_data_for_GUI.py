@@ -1,43 +1,98 @@
 import pandas as pd
 from datetime import datetime
 import numpy as np
+import io
 
 '''This module provides functions to read data from a CSV file and process it for GUI display.'''
 
-def count_lines(csv_filepath):
-    # Open the file in binary mode ('rb') for efficient line counting
+def read_last_n_rows(csv_filepath, n, chunk_size=65536):
     with open(csv_filepath, 'rb') as f:
-        # Iterate over each line in the file and count the total number of lines
-        # sum(1 for _ in f) adds 1 for every line encountered, giving total line count
-        return sum(1 for _ in f)
-    
-def read_last_n_rows(csv_filepath, n):
-    # Count the total number of lines in the file (including the header line)
-    total_lines = count_lines(csv_filepath)
+        # Read and keep the header line separately -- we need it for column
+        # names, but it must not be counted as one of the n data rows
+        header = f.readline()
 
-    # Subtract 1 to exclude the header, giving the number of actual data rows
-    data_lines = total_lines - 1
+        # Jump to the end of the file to get its total size.
+        # (0, 2) means "seek 0 bytes relative to the end of the file"
+        f.seek(0, 2)
+        file_size = f.tell()
 
-    # Determine how many of the earliest data rows to skip
-    # This ensures that only the last `n` rows are read
-    # If there are fewer than `n` rows, skip nothing
-    rows_to_skip = max(0, data_lines - n)
+        # Walk backward from the end in fixed-size chunks, collecting bytes
+        # until we've seen at least n+1 newlines (the +1 covers a partial
+        # line at whatever byte boundary we stop on)
+        pos = file_size
+        newlines_found = 0
+        chunks = []
 
-    # Build the skiprows argument for pandas
-    # If rows_to_skip > 0, skip lines 1 through rows_to_skip (line 0 is the header)
-    # If rows_to_skip == 0, don’t skip any lines (read entire file)
-    if rows_to_skip > 0:
-        skip = range(1, rows_to_skip + 1)
-    else:
-        skip = None
+        while pos > len(header) and newlines_found <= n:
+            read_size = min(chunk_size, pos - len(header))
+            pos -= read_size
+            f.seek(pos)
+            chunk = f.read(read_size)
+            chunks.append(chunk)
+            newlines_found += chunk.count(b'\n')
 
-    # Read the CSV file, skipping the early rows but keeping the header
-    return pd.read_csv(csv_filepath, skiprows=skip)
+        # Chunks were collected back-to-front (last chunk of the file first),
+        # so reverse them before joining to restore correct byte order
+        tail_bytes = b''.join(reversed(chunks))
+
+    # Split into individual lines and keep only the last n
+    # (we likely over-read by a partial line or two, this trims it exactly)
+    lines = tail_bytes.splitlines()[-n:] if n>0 else []
+
+    # Reassemble header + trimmed data lines into something pandas can parse
+    # directly from memory, without ever touching the earlier part of the file
+    csv_text = header + b'\n'.join(lines) + b'\n'
+    return pd.read_csv(io.BytesIO(csv_text))
+
+def read_last_n_rows_filtered(csv_filepath, n, vmm_num, chunk_size=65536):
+    with open(csv_filepath, 'rb') as f:
+        header = f.readline()
+
+        f.seek(0, 2)
+        file_size = f.tell()
+
+        pos = file_size
+        chunks = []
+        matched = []
+
+        while pos > len(header) and len(matched) < n:
+            read_size = min(chunk_size, pos - len(header))
+            pos -= read_size
+            f.seek(pos)
+            chunk = f.read(read_size)
+            chunks.append(chunk)
+
+            # re-filter everything read so far each time, working from
+            # the current back-position to the end of the file
+            tail_bytes = b''.join(reversed(chunks))
+            all_lines = tail_bytes.splitlines()
+
+            matched = []
+            for line in all_lines:
+                parts = line.split(b',')
+                if len(parts) < 5:
+                    continue
+                try:
+                    fec, hyb, vmm = int(parts[1]), int(parts[2]), int(parts[3])
+                except ValueError:
+                    continue
+                if fec * 8 + hyb * 2 + vmm == vmm_num:
+                    matched.append(line)
+
+    lines = matched[-n:] if n > 0 else []
+
+    csv_text = header + b'\n'.join(lines) + b'\n'
+    return pd.read_csv(io.BytesIO(csv_text))
 
 def get_seconds_ago(dataframe):
     # Convert the 'Time' column in the dataframe from string to datetime objects
     # using the specified format: 'Year-Month-Day Hour:Minute:Second'
-    dataframe['timestamp'] = pd.to_datetime(dataframe['Time'], format='%Y-%m-%d %H:%M:%S')
+    if "Time" in dataframe.columns:
+        dataframe['timestamp'] = pd.to_datetime(dataframe['Time'], format='%Y-%m-%d %H:%M:%S')
+    elif "timestamp" in dataframe.columns:
+        dataframe['timestamp'] = pd.to_datetime(dataframe['timestamp'], format='%Y-%m-%d %H:%M:%S')
+    else:
+        raise ValueError("DataFrame must contain either a 'Time' or 'timestamp' column")
 
     # Get the current time as a datetime object
     current_time = datetime.now()
@@ -150,14 +205,19 @@ def get_flowrate(dataframe):
     return pd.Series(flowRate, name='Flowrate', index=dataframe.index)
 
 def get_temperature(dataframe):
-    temperature = dataframe['Temperature']
+    temperature = pd.to_numeric(dataframe['temperature'], errors='coerce')
 
     # Return the temperature values as a pandas Series with the same index as the input DataFrame
     return pd.Series(temperature, name='Temperature', index=dataframe.index)
 
-def get_n_XY_datapoints(csv_filepath, n, datatype):
-    dataframe = read_last_n_rows(csv_filepath, n)
+def get_n_XY_datapoints(csv_filepath, n, datatype, vmm_num):
+    if datatype == 'temperature':
+        dataframe = read_last_n_rows_filtered(csv_filepath, n, vmm_num)
+        times = get_seconds_ago(dataframe)
+        temperature = get_temperature(dataframe)
+        return times, temperature
 
+    dataframe = read_last_n_rows(csv_filepath, n)
     # Depending on the requested datatype, process and return the appropriate data
     if datatype == 'outer_vessel_gauge_1_pressure':
         times = get_seconds_ago(dataframe)
@@ -175,10 +235,6 @@ def get_n_XY_datapoints(csv_filepath, n, datatype):
         times = get_seconds_ago(dataframe)
         flowrates = get_flowrate(dataframe)
         return times, flowrates
-    elif datatype == 'temperature':
-        times = get_seconds_ago(dataframe)
-        temperature = get_temperature(dataframe)
-        return times, temperature
     else:
         # Raise an error if the datatype is not supported
         raise ValueError(f"Unsupported datatype: {datatype}. Supported types are: 'outer_vessel_gauge_1_pressure', 'outer_vessel_gauge_2_pressure', 'inner_vessel_pressure', 'flowrate', 'temperature'.")

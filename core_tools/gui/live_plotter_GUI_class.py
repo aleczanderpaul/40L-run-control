@@ -76,14 +76,15 @@ class LiveTab(QtWidgets.QWidget):
 
         # Internal state tracking for plots
         self.data = {}                            # title -> {x: pandas Series, y: pandas Series, buffer_size: int} (list)
-        self.offsets = {}
+        self.offsets = {}                         # title -> y-offset value (float)
         self.curves = {}                          # title -> plot curves (list)
         self.interval_timers = {}                 # title -> QTimer for updates
         self.elapsed_timers = {}                  # title -> QElapsedTimer for time axis
         self.running_state = {}                   # title -> bool: is plot running
         self.start_stop_buttons = {}              # title -> start/stop QPushButton
-        self.csv_filepaths = {}                    # title -> CSV filepaths from logging to pull data from (list)
+        self.csv_filepaths = {}                   # title -> CSV filepaths from logging to pull data from (list)
         self.datatype = {}                        # Datatype for the plots (e.g., 'pressure', 'temperature')
+        self.vmm_nums = {}                         # title -> VMM numbers (int), only applicable for temperature plots
 
         #Internal state tracking for command buttons
         self.cmd_buttons = {}                     # title -> QPushButton for terminal commands
@@ -94,10 +95,10 @@ class LiveTab(QtWidgets.QWidget):
         #Internal state tracking for dropdown menus
         self.dd_menus = {}                        # title ->
         self.dd_option_names = {}                 # title ->
-        self.dd_option_values = {}                 # title ->
+        self.dd_option_values = {}                # title ->
     
     # Add a new plot with button below it
-    def add_plot(self, title, x_axis, y_axis, offset, buffer_size, csv_filepaths, datatypes): #x_axis and y_axis are tuples of (label, unit), and buffer_size is the number of data points to display at once
+    def add_plot(self, title, x_axis, y_axis, offset, buffer_size, csv_filepaths, datatypes, vmm_nums=None): #x_axis and y_axis are tuples of (label, unit), and buffer_size is the number of data points to display at once
         index = self.plot_counts
         plots_per_row = self.plots_per_row
         self.plot_counts += 1
@@ -118,6 +119,9 @@ class LiveTab(QtWidgets.QWidget):
 
         # Store the datatype for this plot
         self.datatype[title] = datatypes
+
+        # Store the VMM number for this plot, is None if not applicable
+        self.vmm_nums[title] = vmm_nums
 
         num_curves = len(csv_filepaths)
         self.data[title] = []
@@ -156,7 +160,16 @@ class LiveTab(QtWidgets.QWidget):
             x_data, y_data, offset, buffer_size = self.data[title][i]["x"], self.data[title][i]["y"], self.data[title][i]['offset'], self.data[title][i]["buffer_size"]
             csv_filepath = self.csv_filepaths[title][i]
             datatype = self.datatype[title][i]
-            x_data, y_data = get_n_XY_datapoints(csv_filepath, buffer_size, datatype)
+            if self.vmm_nums[title] is not None:
+                vmm_num = self.vmm_nums[title][i]
+            else:
+                vmm_num = None
+            
+            try:
+                x_data, y_data = get_n_XY_datapoints(csv_filepath, buffer_size, datatype, vmm_num)
+            except (pd.errors.ParserError, ValueError):
+                continue
+            
             self.curves[title][i].setData(x=x_data, y=y_data+float(offset))
 
     # Return elapsed time in seconds since the plot started
