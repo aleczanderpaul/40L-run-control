@@ -82,7 +82,7 @@ class LiveTab(QtWidgets.QWidget):
         self.elapsed_timers = {}                  # title -> QElapsedTimer for time axis
         self.running_state = {}                   # title -> bool: is plot running
         self.start_stop_buttons = {}              # title -> start/stop QPushButton
-        self.csv_filepaths = {}                   # title -> CSV filepaths from logging to pull data from (list)
+        self.data_filepaths = {}                   # title -> data filepaths from logging to pull data from (list)
         self.datatype = {}                        # Datatype for the plots (e.g., 'pressure', 'temperature')
         self.vmm_nums = {}                         # title -> VMM numbers (int), only applicable for temperature plots
 
@@ -98,7 +98,7 @@ class LiveTab(QtWidgets.QWidget):
         self.dd_option_values = {}                # title ->
     
     # Add a new plot with button below it
-    def add_plot(self, title, x_axis, y_axis, offset, buffer_size, csv_filepaths, datatypes, vmm_nums=None): #x_axis and y_axis are tuples of (label, unit), and buffer_size is the number of data points to display at once
+    def add_plot(self, title, x_axis, y_axis, offset, buffer_size, data_filepaths, datatypes, vmm_nums=None): #x_axis and y_axis are tuples of (label, unit), and buffer_size is the number of data points to display at once
         index = self.plot_counts
         plots_per_row = self.plots_per_row
         self.plot_counts += 1
@@ -114,8 +114,8 @@ class LiveTab(QtWidgets.QWidget):
         plot_widget.setLabel('left', y_axis[0], units=y_axis[1])
         plot_widget.showGrid(x=True, y=True)
 
-        #Store the filepath of the CSV associated with this plot
-        self.csv_filepaths[title] = csv_filepaths
+        #Store the filepath of the data associated with this plot
+        self.data_filepaths[title] = data_filepaths
 
         # Store the datatype for this plot
         self.datatype[title] = datatypes
@@ -123,7 +123,7 @@ class LiveTab(QtWidgets.QWidget):
         # Store the VMM number for this plot, is None if not applicable
         self.vmm_nums[title] = vmm_nums
 
-        num_curves = len(csv_filepaths)
+        num_curves = len(data_filepaths)
         self.data[title] = []
         self.curves[title] = []
         COLOR_CYCLE = ['y', 'c', 'm', 'r', 'g', 'b', 'w']
@@ -153,12 +153,12 @@ class LiveTab(QtWidgets.QWidget):
         container_widget.setMinimumSize(25*16, 40*9)
         self.layout.addWidget(container_widget, row, col)
 
-    # Update function: fetches data from CSV and updates the plot
+    # Update function: fetches data from file and updates the plot
     def update(self, title):
-        num_curves = len(self.csv_filepaths[title])
+        num_curves = len(self.data_filepaths[title])
         for i in range(0, num_curves):
             x_data, y_data, offset, buffer_size = self.data[title][i]["x"], self.data[title][i]["y"], self.data[title][i]['offset'], self.data[title][i]["buffer_size"]
-            csv_filepath = self.csv_filepaths[title][i]
+            data_filepath = self.data_filepaths[title][i]
             datatype = self.datatype[title][i]
             if self.vmm_nums[title] is not None:
                 vmm_num = self.vmm_nums[title][i]
@@ -166,7 +166,7 @@ class LiveTab(QtWidgets.QWidget):
                 vmm_num = None
             
             try:
-                x_data, y_data = get_n_XY_datapoints(csv_filepath, buffer_size, datatype, vmm_num)
+                x_data, y_data = get_n_XY_datapoints(data_filepath, buffer_size, datatype, vmm_num)
             except (pd.errors.ParserError, ValueError):
                 continue
             
@@ -202,7 +202,7 @@ class LiveTab(QtWidgets.QWidget):
             self.running_state[title] = False
         else:
             # Reset data and timer, restart updates
-            num_curves = len(self.csv_filepaths[title])
+            num_curves = len(self.data_filepaths[title])
             for i in range(0, num_curves):
                 buffer_size = self.data[title][i]["buffer_size"]
                 offset = self.data[title][i]["offset"]
@@ -370,7 +370,7 @@ class LiveTab(QtWidgets.QWidget):
     
     #Change the buffer size of a specified plot, intended to be attached to a dropdown menu
     def change_buffer_size(self, title, ctrl_title, dropdown_text, new_option_value):
-        num_curves = len(self.csv_filepaths[ctrl_title])
+        num_curves = len(self.data_filepaths[ctrl_title])
         for i in range(0, num_curves):
             self.data[i][ctrl_title]["buffer_size"] = new_option_value
 
@@ -378,7 +378,7 @@ class LiveTab(QtWidgets.QWidget):
     #ctrl_titles is a list of titles that correspond to the plots to change
     def change_buffer_size_multiple(self, title, ctrl_titles, dropdown_text, new_option_value):
         for i in range(len(ctrl_titles)):
-            num_curves = len(self.csv_filepaths[str(ctrl_titles[i])])
+            num_curves = len(self.data_filepaths[str(ctrl_titles[i])])
             for l in range(0, num_curves):
                 self.data[str(ctrl_titles[i])][l]["buffer_size"] = new_option_value
     

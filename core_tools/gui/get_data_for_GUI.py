@@ -3,13 +3,13 @@ from datetime import datetime
 import numpy as np
 import io
 
-'''This module provides functions to read data from a CSV file and process it for GUI display.'''
+'''This module provides functions to read data from a file and process it for GUI display.'''
 
-def read_last_n_rows(csv_filepath, n, chunk_size=65536):
-    with open(csv_filepath, 'rb') as f:
+def read_last_n_rows(data_filepath, n, chunk_size=65536, delimiter=',', has_header=True, column_names=None):
+    with open(data_filepath, 'rb') as f:
         # Read and keep the header line separately -- we need it for column
         # names, but it must not be counted as one of the n data rows
-        header = f.readline()
+        header = f.readline() if has_header else b''
 
         # Jump to the end of the file to get its total size.
         # (0, 2) means "seek 0 bytes relative to the end of the file"
@@ -41,12 +41,15 @@ def read_last_n_rows(csv_filepath, n, chunk_size=65536):
 
     # Reassemble header + trimmed data lines into something pandas can parse
     # directly from memory, without ever touching the earlier part of the file
-    csv_text = header + b'\n'.join(lines) + b'\n'
-    return pd.read_csv(io.BytesIO(csv_text))
+    data_text = header + b'\n'.join(lines) + b'\n'
+    if has_header:
+        return pd.read_csv(io.BytesIO(data_text), delimiter=delimiter)
+    else:
+        return pd.read_csv(io.BytesIO(data_text), delimiter=delimiter, header=None, names=column_names)
 
-def read_last_n_rows_filtered(csv_filepath, n, vmm_num, chunk_size=65536):
-    with open(csv_filepath, 'rb') as f:
-        header = f.readline()
+def read_last_n_rows_filtered(data_filepath, n, vmm_num, chunk_size=65536, delimiter=',', has_header=True, column_names=None):
+    with open(data_filepath, 'rb') as f:
+        header = f.readline() if has_header else b''
 
         f.seek(0, 2)
         file_size = f.tell()
@@ -69,7 +72,7 @@ def read_last_n_rows_filtered(csv_filepath, n, vmm_num, chunk_size=65536):
 
             matched = []
             for line in all_lines:
-                parts = line.split(b',')
+                parts = line.split(delimiter.encode())
                 if len(parts) < 5:
                     continue
                 try:
@@ -81,8 +84,11 @@ def read_last_n_rows_filtered(csv_filepath, n, vmm_num, chunk_size=65536):
 
     lines = matched[-n:] if n > 0 else []
 
-    csv_text = header + b'\n'.join(lines) + b'\n'
-    return pd.read_csv(io.BytesIO(csv_text))
+    data_text = header + b'\n'.join(lines) + b'\n'
+    if has_header:
+        return pd.read_csv(io.BytesIO(data_text), delimiter=delimiter)
+    else:
+        return pd.read_csv(io.BytesIO(data_text), delimiter=delimiter, header=None, names=column_names)
 
 def get_seconds_ago(dataframe):
     # Convert the 'Time' column in the dataframe from string to datetime objects
@@ -104,6 +110,14 @@ def get_seconds_ago(dataframe):
     dataframe['seconds_ago'] = -(current_time - dataframe['timestamp']).dt.total_seconds()
 
     # Return the new 'seconds_ago' Series from the dataframe
+    return dataframe['seconds_ago']
+
+def get_seconds_ago_1904_epoch(dataframe):
+    dataframe['timestamp'] = pd.to_datetime(dataframe['Time'], unit='s', origin='1904-01-01')
+
+    current_time = datetime.now()
+    dataframe['seconds_ago'] = -(current_time - dataframe['timestamp']).dt.total_seconds()
+
     return dataframe['seconds_ago']
 
 def get_outer_vessel_gauge_pressure(dataframe, gauge_num):
@@ -162,14 +176,19 @@ def get_temperature(dataframe):
     # Return the temperature values as a pandas Series with the same index as the input DataFrame
     return pd.Series(temperature, name='Temperature', index=dataframe.index)
 
-def get_n_XY_datapoints(csv_filepath, n, datatype, vmm_num):
+def get_n_XY_datapoints(data_filepath, n, datatype, vmm_num):
     if datatype == 'temperature':
-        dataframe = read_last_n_rows_filtered(csv_filepath, n, vmm_num)
+        dataframe = read_last_n_rows_filtered(data_filepath, n, vmm_num)
         times = get_seconds_ago(dataframe)
         temperature = get_temperature(dataframe)
         return times, temperature
+    elif datatype == 'gauge_pressure':
+        dataframe = read_last_n_rows(data_filepath, n, delimiter='\t', has_header=False, column_names=['Time', 'Voltage'])
+        times = get_seconds_ago_1904_epoch(dataframe)
+        gauge_pressure = dataframe['Voltage']  # In our specific case, the gauge pressure sensor has a 5 Torr range and output is -5V to +5V, so 1V = 1 Torr
+        return times, gauge_pressure
 
-    dataframe = read_last_n_rows(csv_filepath, n)
+    dataframe = read_last_n_rows(data_filepath, n)
     # Depending on the requested datatype, process and return the appropriate data
     if datatype == 'outer_vessel_gauge_1_pressure':
         times = get_seconds_ago(dataframe)
@@ -189,4 +208,4 @@ def get_n_XY_datapoints(csv_filepath, n, datatype, vmm_num):
         return times, flowrates
     else:
         # Raise an error if the datatype is not supported
-        raise ValueError(f"Unsupported datatype: {datatype}. Supported types are: 'outer_vessel_gauge_1_pressure', 'outer_vessel_gauge_2_pressure', 'inner_vessel_pressure', 'flowrate', 'temperature'.")
+        raise ValueError(f"Unsupported datatype: {datatype}. Supported types are: 'outer_vessel_gauge_1_pressure', 'outer_vessel_gauge_2_pressure', 'inner_vessel_pressure', 'gauge_pressure', 'flowrate', 'temperature'.")
