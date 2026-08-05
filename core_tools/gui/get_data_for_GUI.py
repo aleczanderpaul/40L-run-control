@@ -1,5 +1,5 @@
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 import numpy as np
 import io
 
@@ -113,10 +113,10 @@ def get_seconds_ago(dataframe):
     return dataframe['seconds_ago']
 
 def get_seconds_ago_1904_epoch(dataframe):
-    dataframe['timestamp'] = pd.to_datetime(dataframe['Time'], unit='s', origin='1904-01-01')
+    dataframe['timestamp'] = pd.to_datetime(dataframe['Time'], unit='s', origin='1904-01-01', utc=True)
 
-    current_time = datetime.now()
-    dataframe['seconds_ago'] = -(current_time - dataframe['timestamp']).dt.total_seconds()
+    current_time_utc = datetime.now(timezone.utc)
+    dataframe['seconds_ago'] = -(current_time_utc - dataframe['timestamp']).dt.total_seconds()
 
     return dataframe['seconds_ago']
 
