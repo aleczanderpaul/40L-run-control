@@ -150,37 +150,31 @@ def get_outer_vessel_gauge_pressure(dataframe, gauge_num):
     # Return the pressure values as a pandas Series with the same index as the input DataFrame
     return pd.Series(pressure, name='Pressure', index=dataframe.index)
 
-def get_inner_vessel_pressure(dataframe):
-    flowRate = pd.to_numeric(dataframe['Alicat_Abs_Press_torr'], errors='coerce') #will need to change column name if it changes in FlowVision2
-    return pd.Series(flowRate, name='Pressure', index=dataframe.index)
-
-def get_flowrate(dataframe):
-    flowRate = pd.to_numeric(dataframe['FlowRate'], errors='coerce')
-
-    #Invalidate flowrate if units are bad
-    units = dataframe['FlowRateUnits']
-
-    units_not_valid_indices = np.where(units == 'Bad')[0]
-
-    flowRate[units_not_valid_indices] = np.nan
-
-    #Convert to L/min
-    units_SCCM_indices = np.where(units == 'SCCM')[0]
-    flowRate[units_SCCM_indices] = flowRate[units_SCCM_indices] / 1000.0
+def get_filter_line_flowrate(dataframe):
+    flowRate = pd.to_numeric(dataframe['mass_flow_SLPM'], errors='coerce')
 
     return pd.Series(flowRate, name='Flowrate', index=dataframe.index)
 
-def get_temperature(dataframe):
+def get_filter_line_pressure(dataframe):
+    pressure = pd.to_numeric(dataframe['abs_pressure_Torr'], errors='coerce')
+
+    return pd.Series(pressure, name='Pressure', index=dataframe.index)
+
+def get_filter_line_temperature(dataframe):
+    temperature = pd.to_numeric(dataframe['temperature_C'], errors='coerce')
+
+    return pd.Series(temperature, name='Temperature', index=dataframe.index)
+
+def get_VMM_temperature(dataframe):
     temperature = pd.to_numeric(dataframe['temperature'], errors='coerce')
 
-    # Return the temperature values as a pandas Series with the same index as the input DataFrame
     return pd.Series(temperature, name='Temperature', index=dataframe.index)
 
 def get_n_XY_datapoints(data_filepath, n, datatype, vmm_num):
-    if datatype == 'temperature':
+    if datatype == 'vmm_temperature':
         dataframe = read_last_n_rows_filtered(data_filepath, n, vmm_num)
         times = get_seconds_ago(dataframe)
-        temperature = get_temperature(dataframe)
+        temperature = get_VMM_temperature(dataframe)
         return times, temperature
     elif datatype == 'gauge_pressure':
         dataframe = read_last_n_rows(data_filepath, n, delimiter='\t', has_header=False, column_names=['Time', 'Voltage'])
@@ -198,14 +192,18 @@ def get_n_XY_datapoints(data_filepath, n, datatype, vmm_num):
         times = get_seconds_ago(dataframe)
         pressures = get_outer_vessel_gauge_pressure(dataframe, 2)
         return times, pressures
-    elif datatype == 'inner_vessel_pressure':
+    elif datatype == 'filter_line_flowrate':
         times = get_seconds_ago(dataframe)
-        pressures = get_inner_vessel_pressure(dataframe)
-        return times, pressures
-    elif datatype == 'flowrate':
-        times = get_seconds_ago(dataframe)
-        flowrates = get_flowrate(dataframe)
+        flowrates = get_filter_line_flowrate(dataframe)
         return times, flowrates
+    elif datatype == 'filter_line_pressure':
+        times = get_seconds_ago(dataframe)
+        pressures = get_filter_line_pressure(dataframe)
+        return times, pressures
+    elif datatype == 'filter_line_temperature':
+        times = get_seconds_ago(dataframe)
+        temperatures = get_filter_line_temperature(dataframe)
+        return times, temperatures
     else:
         # Raise an error if the datatype is not supported
-        raise ValueError(f"Unsupported datatype: {datatype}. Supported types are: 'outer_vessel_gauge_1_pressure', 'outer_vessel_gauge_2_pressure', 'inner_vessel_pressure', 'gauge_pressure', 'flowrate', 'temperature'.")
+        raise ValueError(f"Unsupported datatype: {datatype}. Supported types are: 'outer_vessel_gauge_1_pressure', 'outer_vessel_gauge_2_pressure', 'gauge_pressure', 'filter_line_flowrate', 'filter_line_pressure', 'filter_line_temperature', 'vmm_temperature'.")

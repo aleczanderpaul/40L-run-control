@@ -167,7 +167,8 @@ class LiveTab(QtWidgets.QWidget):
             
             try:
                 x_data, y_data = get_n_XY_datapoints(data_filepath, buffer_size, datatype, vmm_num)
-            except (pd.errors.ParserError, ValueError):
+            except (pd.errors.ParserError, ValueError) as e:
+                print(f"[{title}] update failed: {e}")
                 continue
             
             self.curves[title][i].setData(x=x_data, y=y_data+float(offset))
@@ -354,9 +355,9 @@ class LiveTab(QtWidgets.QWidget):
     def change_cmd_button_command(self, title, new_command):
         self.cmd_command_strings[title] = new_command
     
-    #Specialized function specifically for the 40L TPC log pressure and/or log/change gas flowrate command, will likely not be useful for a general user of this program
+    #Specialized function specifically for the 40L TPC commands, will likely not be useful for a general user of this program
     #People using this program for a different use case will need to edit this function and/or write a new one to do the editing they need to the command string
-    def change_pressure_or_flowrate_cmd(self, title, ctrl_title, dropdown_text, new_option_value):
+    def change_cmd(self, title, ctrl_title, dropdown_text, new_option_value):
         old_command = self.cmd_command_strings[ctrl_title]
 
         parts = old_command.split()
