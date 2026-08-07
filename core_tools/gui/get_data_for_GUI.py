@@ -165,6 +165,11 @@ def get_filter_line_temperature(dataframe):
 
     return pd.Series(temperature, name='Temperature', index=dataframe.index)
 
+def get_filter_line_H2O_concentration(dataframe):
+    H2O_concentration = pd.to_numeric(dataframe['H2O_ppm'], errors='coerce')
+
+    return pd.Series(H2O_concentration, name='H2O Concentration', index=dataframe.index)
+
 def get_VMM_temperature(dataframe):
     temperature = pd.to_numeric(dataframe['temperature'], errors='coerce')
 
@@ -204,6 +209,10 @@ def get_n_XY_datapoints(data_filepath, n, datatype, vmm_num):
         times = get_seconds_ago(dataframe)
         temperatures = get_filter_line_temperature(dataframe)
         return times, temperatures
+    elif datatype == 'filter_line_H2O_concentration':
+        times = get_seconds_ago(dataframe)
+        H2O_concentrations = get_filter_line_H2O_concentration(dataframe)
+        return times, H2O_concentrations
     else:
         # Raise an error if the datatype is not supported
-        raise ValueError(f"Unsupported datatype: {datatype}. Supported types are: 'outer_vessel_gauge_1_pressure', 'outer_vessel_gauge_2_pressure', 'gauge_pressure', 'filter_line_flowrate', 'filter_line_pressure', 'filter_line_temperature', 'vmm_temperature'.")
+        raise ValueError(f"Unsupported datatype: {datatype}. Supported types are: 'outer_vessel_gauge_1_pressure', 'outer_vessel_gauge_2_pressure', 'gauge_pressure', 'filter_line_flowrate', 'filter_line_pressure', 'filter_line_temperature', 'filter_line_H2O_concentration', 'vmm_temperature'.")
