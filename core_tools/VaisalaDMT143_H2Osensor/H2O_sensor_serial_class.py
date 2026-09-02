@@ -48,13 +48,19 @@ class VaisalaDMT143Serial:
         return self._send_command('?')
 
     def GetDeviceInfoInsidePollMode(self):
-            return self._send_command('??')
+        return self._send_command('??')
 
     def SetUnit(self, mORn): #mORn = 'm' for metric or 'n' for non-metric
         return self._send_command('UNIT' + ' ' + mORn)
 
+    #did not use _send_command function to optimize speed
+    #data is <750 bytes so _send_command will wait for timeout to trigger, which is good for general one-time use functions, but not for continuous readout
     def GetReading(self): #will not work if sensor is in POLL mode because an address will be required
-        return self._send_command('SEND')
+        self.ser.reset_input_buffer()
+        self.ser.write(('SEND' + '\r').encode('ascii'))
+        time.sleep(0.1)
+        raw = self.ser.readline().decode('utf-8', errors='replace')
+        return raw.strip()
 
     def EscapeRunMode(self):
         return self._send_command('\x1b') #Send ESC command to escape RUN mode
