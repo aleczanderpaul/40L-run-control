@@ -1220,25 +1220,29 @@ class VMMTab(QtWidgets.QWidget):
         self.overlay_widget.setLabel('left', 'Temperature', units='degC')
         self.overlay_widget.showGrid(x=True, y=True)
         self.overlay_widget.addLegend()
+        self.overlay_widget.setMinimumHeight(380)
         splitter.addWidget(self.overlay_widget)
 
         bottom_widget = QtWidgets.QWidget()
+        bottom_widget.setMinimumHeight(220)
         bottom_layout = QtWidgets.QVBoxLayout()
         bottom_layout.setContentsMargins(4, 4, 4, 4)
         bottom_widget.setLayout(bottom_layout)
 
         controls_row = QtWidgets.QHBoxLayout()
         select_all_button = QtWidgets.QPushButton('Select All')
+        select_all_button.setMinimumHeight(32)
         select_all_button.clicked.connect(self.select_all)
         controls_row.addWidget(select_all_button)
         select_none_button = QtWidgets.QPushButton('Select None')
+        select_none_button.setMinimumHeight(32)
         select_none_button.clicked.connect(self.select_none)
         controls_row.addWidget(select_none_button)
         controls_row.addStretch(1)
         bottom_layout.addLayout(controls_row)
 
         grid = QtWidgets.QGridLayout()
-        grid.setSpacing(2)
+        grid.setSpacing(4)
         columns = 4
         for i, channel_id in enumerate(self.channel_ids):
             tile = self._build_tile(channel_id)
@@ -1252,7 +1256,10 @@ class VMMTab(QtWidgets.QWidget):
         # setStretchFactor only governs resize behavior, not the initial split (which
         # QSplitter otherwise derives from sizeHint(), letting 16 tiles' natural width
         # dominate and squeeze the plot down to a sliver) -- pin a sane initial split.
-        splitter.setSizes([600, 200])
+        # The explicit minimum heights above are the actual floor once the tab's own
+        # scroll area is involved: if the window is too short to give both panes at
+        # least their minimum, the tab scrolls instead of squeezing them further.
+        splitter.setSizes([700, 260])
 
         if threshold is None:
             for channel_id in self.channel_ids:
@@ -1270,8 +1277,17 @@ class VMMTab(QtWidgets.QWidget):
             self._colors[channel_id] = color
             self.curves[channel_id] = self.overlay_widget.plot(pen=color, name=channel.label)
 
+        # Unlike LiveTab/OverviewTab, this tab previously had no scroll area at all,
+        # so on a shorter window both the plot and the tile grid just got squeezed
+        # below a usable size with no way to see them properly. Now the splitter's
+        # pinned minimum heights are an actual floor: if the window is too short for
+        # both, the tab scrolls instead of shrinking either pane further.
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(splitter)
+
         outer_layout = QtWidgets.QVBoxLayout()
-        outer_layout.addWidget(splitter)
+        outer_layout.addWidget(scroll)
         self.setLayout(outer_layout)
 
     def _build_tile(self, channel_id):
@@ -1282,8 +1298,8 @@ class VMMTab(QtWidgets.QWidget):
         frame = QtWidgets.QFrame()
         frame.setFrameShape(QtWidgets.QFrame.Box)
         row = QtWidgets.QHBoxLayout()
-        row.setContentsMargins(4, 1, 4, 1)
-        row.setSpacing(4)
+        row.setContentsMargins(6, 4, 6, 4)
+        row.setSpacing(6)
         frame.setLayout(row)
 
         checkbox = QtWidgets.QCheckBox()
@@ -1292,12 +1308,12 @@ class VMMTab(QtWidgets.QWidget):
         row.addWidget(checkbox)
 
         label = QtWidgets.QLabel(f"VMM {channel.vmm_num} (F{fec}/H{hyb}/V{vmm})")
-        label.setStyleSheet("font-size: 10px;")
+        label.setStyleSheet("font-size: 11px;")
         row.addWidget(label)
 
         value_label = QtWidgets.QLabel('—')
-        value_label.setStyleSheet("font-size: 10px;")
-        value_label.setWordWrap(True)  # VMMTab has no scroll area, so an unwrapped label here would push the window wider -- see AlarmBanner
+        value_label.setStyleSheet("font-size: 11px;")
+        value_label.setWordWrap(True)  # avoids a very long stale-age string forcing this tile wider than its grid cell
         row.addWidget(value_label)
         row.addStretch(1)
 
