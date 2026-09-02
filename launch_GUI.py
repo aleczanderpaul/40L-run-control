@@ -5,7 +5,6 @@ from core_tools.alarms import AlarmSpec
 
 '''Launches run control GUI for the 40L system as specified by the user in this file.'''
 #Create the files for logging data BEFORE registering the relevant channel because the plotter will look for the file when the channel is registered. Use the create_X_log_csv functions to create the files.
-#Do NOT use any filenames with whitespaces in them, as this will cause issues with the terminal command buttons.
 #The widgets (plots, buttons, etc.) are added to the GUI window in the order they are written here and fill from left to right, top to bottom.
 #For more infromation on how to use the LivePlotter class, see source code at core_tools/gui/live_plotter_GUI_class.py
 
@@ -107,15 +106,15 @@ pressure_tab.start_timer(plot_id='filter_line_h2o', interval_ms=interval_time_ms
 #pressure tab controls
 pressure_ctrl_plot_ids = ['ov_pressure', 'gauge_pressure', 'filter_line_flow', 'filter_line_pressure', 'filter_line_temperature', 'filter_line_h2o']
 
-pressure_tab.add_dropdown_menu(title='Pressure log increment', option_names=['2s', '10s', '1m', '10m', '1hr'], option_values=[2, 10, 60, 600, 3600], ctrl_var='Log Outer Vessel Pressure', on_change_callback=pressure_tab.change_cmd)
-pressure_tab.add_dropdown_menu(title='H2O concentration log increment', option_names=['2s', '10s', '1m', '10m', '1hr'], option_values=[2, 10, 60, 600, 3600], ctrl_var='Log H2O Concentration', on_change_callback=pressure_tab.change_cmd)
-
-pressure_tab.add_command_button(title='Log Outer Vessel Pressure', command=f'python log_pressure.py {outer_vessel_pressure_log_filepath} COM3 2')
-pressure_tab.add_command_button(title='Log H2O Concentration', command=f'python log_H2O_readings.py {vaisala_H2O_log_filepath} COM7 2')
+log_interval_options = [('2s', 2), ('10s', 10), ('1m', 60), ('10m', 600), ('1hr', 3600)]
+pressure_tab.add_logger_control(id='log_ov_pressure', label='OV Pressure', script='log_pressure.py',
+                                 log_filepath=outer_vessel_pressure_log_filepath, port='COM3',
+                                 interval_options=log_interval_options, default_interval=2)
+pressure_tab.add_logger_control(id='log_h2o', label='H2O Concentration', script='log_H2O_readings.py',
+                                 log_filepath=vaisala_H2O_log_filepath, port='COM7',
+                                 interval_options=log_interval_options, default_interval=2)
 
 pressure_tab.add_dropdown_menu(title='# data points shown', option_names=['10', '50', '100', '1000', '10000', '100000'], option_values=[10, 50, 100, 1000, 10000, 100000], ctrl_var=pressure_ctrl_plot_ids, on_change_callback=pressure_tab.change_buffer_size_multiple)
-
-pressure_tab.cmd_timer(100)
 
 '''VMM TEMPERATURES TAB'''
 temp_tab = plotter.create_tab(tab_name='VMM Temperatures', plots_per_row=4)

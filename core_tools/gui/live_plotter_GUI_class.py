@@ -3,15 +3,18 @@ import pyqtgraph as pg
 import sys
 import pandas as pd
 import subprocess
-import shlex
+import threading
 import platform
+import serial.tools.list_ports
 
 from .get_data_for_GUI import get_n_XY_datapoints
-from .models import Channel, Plot
+from .models import Channel, Plot, LoggerControl
 
 '''Class to handle live plotting and add various controls/buttons in a Qt GUI application.'''
 
 COLOR_CYCLE = ['y', 'c', 'm', 'r', 'g', 'b', 'w']
+
+LED_COLORS = {'running': '#2ecc71', 'stopped': '#95a5a6', 'crashed': '#e74c3c'}
 
 
 class LivePlotter:
@@ -27,9 +30,18 @@ class LivePlotter:
         self.main_window.setCentralWidget(self.main_widget)
         self.main_window.setWindowTitle(win_title)
 
-        # Add a tab widget to the main layout
+        # Tabs (left) and the persistent control dock (right) sit side by side and stay
+        # visible regardless of which tab is selected -- same treatment as the status
+        # strip/banner/event log, which live in main_layout above/below this splitter.
         self.tabs = QtWidgets.QTabWidget()
-        self.main_layout.addWidget(self.tabs)
+        self.control_dock = ControlDock(self)
+
+        self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.main_splitter.addWidget(self.tabs)
+        self.main_splitter.addWidget(self.control_dock)
+        self.main_splitter.setStretchFactor(0, 4)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_layout.addWidget(self.main_splitter)
 
         self.tab_objects = {}  # tab_name -> LiveTab object
         self.channels = {}     # channel_id -> Channel, registered once, shared across all tabs
@@ -54,10 +66,9 @@ class LivePlotter:
         self.tabs.addTab(tab, tab_name)
         return tab
 
-    # Call cleanup function for each tab to end all running subprocesses
+    # End all running logger subprocesses
     def cleanup(self):
-        for tab_name in self.tab_objects:
-            self.tab_objects[tab_name].cleanup()
+        self.control_dock.cleanup()
 
     # Show the window and start the event loop
     def run(self):
@@ -90,13 +101,6 @@ class LiveTab(QtWidgets.QWidget):
         self.plot_counts = 0
 
         self.plots = {}  # plot_id -> Plot (identity/config/runtime all in one place)
-
-        # Internal state tracking for command buttons (superseded by add_logger_control soon)
-        self.cmd_buttons = {}             # title -> QPushButton for terminal commands
-        self.cmd_processes = {}           # title -> subprocess.Popen object for running commands
-        self.cmd_running_state = {}       # title -> bool: is command running
-        self.cmd_command_strings = {}     # title -> command string (useful if we want to change command on the fly)
-        self.cmd_status_timer = None      # QTimer polling check_command_status, held to prevent garbage collection
 
         # Internal state tracking for dropdown menus
         self.dd_menus = {}
@@ -218,100 +222,13 @@ class LiveTab(QtWidgets.QWidget):
             plot.start_stop_button.setStyleSheet("background-color: red;")
             plot.running = True
 
-    # Run a terminal command using subprocess
-    def run_terminal_command(self, title, command):
-        system = platform.system()
-
-        if system == 'Windows':
-            # Use shlex.split to safely split the command respecting shell syntax
-            cmd_parts = shlex.split(command, posix=False)  # Use posix=False for Windows compatibility
-            process = subprocess.Popen(cmd_parts, shell=True)  # Use shell=True for Windows to handle commands correctly
-        else:
-            cmd_parts = shlex.split(command)
-            process = subprocess.Popen(cmd_parts)
-
-        self.cmd_processes[title] = process
-
-    # Terminate a running terminal command
-    def stop_terminal_command(self, title):
-        process = self.cmd_processes[title]
-
-        # Check if the process is still running and terminate it
-        if process and process.poll() is None:
-            system = platform.system()
-            if system == 'Windows':
-                subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], check=True)
-            else:
-                process.kill()
-
-    # Handle button click for starting/stopping terminal commands
-    def cmd_button_clicked(self, title):
-        command = self.cmd_command_strings[title]  # this method allows us to dynamically change the command if necessary
-        if self.cmd_running_state[title]:
-            # If the command is running, stop it
-            self.stop_terminal_command(title)
-
-            cmd_button = self.cmd_buttons[title]
-            cmd_button.setText(f'Start {title}')
-            cmd_button.setStyleSheet("background-color: green;")
-
-            self.cmd_running_state[title] = False
-        else:
-            # If the command is not running, start it
-            self.run_terminal_command(title, command)
-
-            cmd_button = self.cmd_buttons[title]
-            cmd_button.setText(f'Stop {title}')
-            cmd_button.setStyleSheet("background-color: red;")
-
-            self.cmd_running_state[title] = True
-
-    # Add a button that runs a terminal command on click
-    def add_command_button(self, title, command):
-        index = self.plot_counts
-        plots_per_row = self.plots_per_row
-        self.plot_counts += 1
-        row = index // plots_per_row
-        col = index % plots_per_row
-
-        # Vertical layout to hold the plot and button
-        container = QtWidgets.QVBoxLayout()
-
-        # Create button
-        cmd_button = QtWidgets.QPushButton(f'Start {title}')
-        cmd_button.setStyleSheet("background-color: green;")
-        self.cmd_command_strings[title] = command
-        cmd_button.clicked.connect(lambda _, t=title: self.cmd_button_clicked(t))
-        self.cmd_buttons[title] = cmd_button
-
-        # Add button to vertical container
-        container.addWidget(cmd_button)
-
-        # Wrap the layout in a QWidget and add it to the grid
-        container_widget = QtWidgets.QWidget()
-        container_widget.setLayout(container)
-        self.layout.addWidget(container_widget, row, col)
-
-        # Mark the command as not running
-        self.cmd_running_state[title] = False
-
-    # Check the status of all command processes and update button states
-    def check_command_status(self):
-        for title in self.cmd_processes:
-            process = self.cmd_processes[title]
-            if process.poll() is not None:
-                # Process has finished, update button state
-                cmd_button = self.cmd_buttons[title]
-                cmd_button.setText(f'Start {title}')
-                cmd_button.setStyleSheet("background-color: green;")
-                self.cmd_running_state[title] = False
-
-    def cmd_timer(self, interval_ms):
-        # Create a timer to check command status on a regular interval
-        timer = QtCore.QTimer()
-        timer.timeout.connect(lambda: self.check_command_status())
-        timer.start(interval_ms)
-        self.cmd_status_timer = timer  # held to prevent garbage collection
+    # Register a logger's controls (LED, port, interval, start/stop) in the shared
+    # control dock -- see ControlDock.add_logger_group for what this actually builds.
+    def add_logger_control(self, id, label, script, log_filepath, port, interval_options, default_interval):
+        return self.plotter.control_dock.add_logger_group(
+            id=id, label=label, script=script, log_filepath=log_filepath, port=port,
+            interval_options=interval_options, default_interval=default_interval,
+        )
 
     # Add a dropdown menu with specified options and values attached to the options
     def add_dropdown_menu(self, title, option_names, option_values, ctrl_var=None, on_change_callback=None):
@@ -355,33 +272,190 @@ class LiveTab(QtWidgets.QWidget):
         container_widget.setMaximumWidth(500)  # prevent stretching (aesthetics)
         self.layout.addWidget(container_widget, row, col)
 
-    # Changes the command string associated with a specified command button based on the title of the button
-    def change_cmd_button_command(self, title, new_command):
-        self.cmd_command_strings[title] = new_command
-
-    # Specialized function specifically for the 40L TPC commands, will likely not be useful for a general user of this program
-    # People using this program for a different use case will need to edit this function and/or write a new one to do the editing they need to the command string
-    def change_cmd(self, title, ctrl_title, dropdown_text, new_option_value):
-        old_command = self.cmd_command_strings[ctrl_title]
-
-        parts = old_command.split()
-        parts[-1] = str(new_option_value)
-
-        new_command = ' '.join(parts)
-
-        print(f'New Command: {new_command}')  # for debugging
-
-        self.change_cmd_button_command(ctrl_title, new_command)
-
     # Change the buffer size of multiple plots at once, intended to be attached to a dropdown menu.
     # ctrl_plot_ids is a list of plot_ids that correspond to the plots to change.
     def change_buffer_size_multiple(self, title, ctrl_plot_ids, dropdown_text, new_option_value):
         for plot_id in ctrl_plot_ids:
             self.plots[str(plot_id)].buffer_size = new_option_value
 
-    # End all running subprocesses
+
+class ControlDock(QtWidgets.QWidget):
+    '''Persistent right-hand dock, visible regardless of which tab is selected. Owns
+    every logger's structured subprocess lifecycle (LED, port/interval dropdowns,
+    start/stop, crash reporting) -- LiveTab.add_logger_control() just forwards here.'''
+
+    def __init__(self, plotter):
+        super().__init__()
+        self.plotter = plotter
+        self.loggers = {}  # id -> LoggerControl
+
+        self.layout = QtWidgets.QVBoxLayout()
+        self.setLayout(self.layout)
+
+        self.loggers_layout = QtWidgets.QVBoxLayout()
+        self.layout.addLayout(self.loggers_layout)
+        self.layout.addStretch(1)
+
+        # Polls every logger's subprocess for an unexpected exit; this is deliberately
+        # decoupled from any single logger's own start/stop so a crash is caught even
+        # if nothing else touches that logger's controls.
+        self._status_timer = QtCore.QTimer()
+        self._status_timer.timeout.connect(self._poll_loggers)
+        self._status_timer.start(500)
+
+    def _set_led(self, logger, state):
+        logger.led.setStyleSheet(f"background-color: {LED_COLORS[state]}; border-radius: 6px;")
+
+    # Build one logger's group box: LED, port dropdown (from the live serial port
+    # list, defaulting to the declared port), interval dropdown, start/stop button,
+    # and a hidden error line that appears only on an unexpected exit.
+    def add_logger_group(self, id, label, script, log_filepath, port, interval_options, default_interval):
+        logger = LoggerControl(
+            id=id, label=label, script=script, log_filepath=log_filepath,
+            interval_options=interval_options, default_interval=default_interval, port=port,
+        )
+
+        box = QtWidgets.QGroupBox(label)
+        box_layout = QtWidgets.QVBoxLayout()
+        box.setLayout(box_layout)
+
+        status_row = QtWidgets.QHBoxLayout()
+        led = QtWidgets.QLabel()
+        led.setFixedSize(12, 12)
+        logger.led = led
+        status_row.addWidget(led)
+        status_row.addWidget(QtWidgets.QLabel(label))
+        status_row.addStretch(1)
+        box_layout.addLayout(status_row)
+
+        port_combo = QtWidgets.QComboBox()
+        available_ports = [p.device for p in serial.tools.list_ports.comports()]
+        if port not in available_ports:
+            available_ports = [port] + available_ports
+        port_combo.addItems(available_ports)
+        port_combo.setCurrentText(port)
+        logger.port_combo = port_combo
+        box_layout.addWidget(port_combo)
+
+        interval_combo = QtWidgets.QComboBox()
+        default_index = 0
+        for i, (option_label, option_value) in enumerate(interval_options):
+            interval_combo.addItem(option_label, userData=option_value)
+            if option_value == default_interval:
+                default_index = i
+        interval_combo.setCurrentIndex(default_index)
+        interval_combo.currentIndexChanged.connect(lambda idx, lid=id: self._interval_changed(lid, idx))
+        logger.interval_combo = interval_combo
+        box_layout.addWidget(interval_combo)
+
+        error_label = QtWidgets.QLabel('')
+        error_label.setStyleSheet('color: #e74c3c; font-size: 10px;')
+        error_label.setWordWrap(True)
+        error_label.hide()
+        logger.error_label = error_label
+        box_layout.addWidget(error_label)
+
+        start_stop_button = QtWidgets.QPushButton(f'Start {label}')
+        start_stop_button.setStyleSheet("background-color: green;")
+        start_stop_button.clicked.connect(lambda _, lid=id: self._toggle_logger(lid))
+        logger.start_stop_button = start_stop_button
+        box_layout.addWidget(start_stop_button)
+
+        self.loggers[id] = logger
+        self._set_led(logger, 'stopped')
+        self.loggers_layout.addWidget(box)
+        return logger
+
+    # Changing the interval while a logger is running must not silently do nothing:
+    # stash it and apply on the next start, rather than restarting the process here.
+    def _interval_changed(self, logger_id, idx):
+        logger = self.loggers[logger_id]
+        new_value = logger.interval_combo.itemData(idx)
+        if logger.running:
+            logger.pending_interval = new_value
+            print(f"[{logger.label}] interval change to {logger.interval_combo.itemText(idx)} will apply on next start")
+        else:
+            logger.pending_interval = None
+
+    def _toggle_logger(self, logger_id):
+        logger = self.loggers[logger_id]
+        if logger.running:
+            self._stop_logger(logger)
+        else:
+            self._start_logger(logger)
+
+    def _start_logger(self, logger):
+        interval = logger.pending_interval if logger.pending_interval is not None else logger.interval_combo.currentData()
+        port = logger.port_combo.currentText()
+        # argv is a real list -- never a shell string -- so filenames/ports with
+        # spaces need no special handling, and sys.executable ensures the venv
+        # interpreter (not a bare 'python' off PATH) runs the logger.
+        argv = [sys.executable, logger.script, logger.log_filepath, port, str(interval)]
+
+        process = subprocess.Popen(argv, stderr=subprocess.PIPE, text=True, bufsize=1)
+        logger.process = process
+        logger.user_stopped = False
+        logger.stderr_lines = []
+        logger.pending_interval = None
+
+        # Read stderr on a background thread so the GUI thread never blocks on it;
+        # captured lines are surfaced on an unexpected exit (see _poll_loggers).
+        thread = threading.Thread(target=self._read_stderr, args=(logger,), daemon=True)
+        thread.start()
+
+        logger.running = True
+        logger.start_stop_button.setText(f'Stop {logger.label}')
+        logger.start_stop_button.setStyleSheet("background-color: red;")
+        logger.error_label.hide()
+        self._set_led(logger, 'running')
+
+    def _read_stderr(self, logger):
+        process = logger.process
+        if process.stderr is None:
+            return
+        for line in process.stderr:
+            line = line.rstrip('\n')
+            if line:
+                logger.stderr_lines.append(line)
+                if len(logger.stderr_lines) > 200:
+                    logger.stderr_lines.pop(0)
+                print(f"[{logger.label} stderr] {line}")  # routed to the real event log in a later commit
+
+    def _stop_logger(self, logger):
+        logger.user_stopped = True
+        self._kill(logger.process)
+        logger.running = False
+        logger.start_stop_button.setText(f'Start {logger.label}')
+        logger.start_stop_button.setStyleSheet("background-color: green;")
+        self._set_led(logger, 'stopped')
+
+    @staticmethod
+    def _kill(process):
+        if process and process.poll() is None:
+            if platform.system() == 'Windows':
+                subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], check=True)
+            else:
+                process.kill()
+
+    # Never silently flip a crashed logger's button back to "everything is fine" --
+    # an unexpected exit gets a red LED and the last captured stderr line.
+    def _poll_loggers(self):
+        for logger in self.loggers.values():
+            if logger.running and logger.process is not None and logger.process.poll() is not None:
+                exit_code = logger.process.returncode
+                logger.running = False
+                logger.start_stop_button.setText(f'Start {logger.label}')
+                logger.start_stop_button.setStyleSheet("background-color: green;")
+                if logger.user_stopped:
+                    self._set_led(logger, 'stopped')
+                else:
+                    self._set_led(logger, 'crashed')
+                    last_line = logger.stderr_lines[-1] if logger.stderr_lines else '(no stderr captured)'
+                    logger.error_label.setText(f'exit code {exit_code}: {last_line}')
+                    logger.error_label.show()
+                    print(f"Logger {logger.label} exited unexpectedly (code {exit_code}): {last_line}")  # routed to the real event log in a later commit
+
     def cleanup(self):
-        for title in self.cmd_processes:
-            process = self.cmd_processes[title]
-            if process.poll() is None:
-                self.stop_terminal_command(title)
+        for logger in self.loggers.values():
+            logger.user_stopped = True
+            self._kill(logger.process)

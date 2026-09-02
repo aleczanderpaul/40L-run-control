@@ -42,3 +42,27 @@ class Plot:
     interval_timer: object = None
     elapsed_timer: object = None
     running: bool = False
+
+
+@dataclass
+class LoggerControl:
+    id: str
+    label: str
+    script: str
+    log_filepath: str
+    interval_options: list  # [(option_label, seconds), ...]
+    default_interval: float
+    port: str
+
+    # Runtime state, populated by ControlDock.add_logger_group() and mutated as it runs.
+    process: object = None
+    stderr_lines: list = field(default_factory=list)
+    running: bool = False
+    user_stopped: bool = True
+    pending_interval: float | None = None
+
+    port_combo: object = None
+    interval_combo: object = None
+    start_stop_button: object = None
+    led: object = None
+    error_label: object = None
