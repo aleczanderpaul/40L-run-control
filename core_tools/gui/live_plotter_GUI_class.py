@@ -1,14 +1,18 @@
 from pyqtgraph.Qt import QtWidgets, QtCore
 import pyqtgraph as pg
-import numpy as np
 import sys
 import pandas as pd
-from .get_data_for_GUI import get_n_XY_datapoints
 import subprocess
 import shlex
 import platform
 
+from .get_data_for_GUI import get_n_XY_datapoints
+from .models import Channel, Plot
+
 '''Class to handle live plotting and add various controls/buttons in a Qt GUI application.'''
+
+COLOR_CYCLE = ['y', 'c', 'm', 'r', 'g', 'b', 'w']
+
 
 class LivePlotter:
     def __init__(self, win_title):
@@ -28,33 +32,44 @@ class LivePlotter:
         self.main_layout.addWidget(self.tabs)
 
         self.tab_objects = {}  # tab_name -> LiveTab object
+        self.channels = {}     # channel_id -> Channel, registered once, shared across all tabs
 
-        #Calls the clanup function when the application is about to quit so that all running subprocesses are terminated
+        # Calls the cleanup function when the application is about to quit so that all running subprocesses are terminated
         self.app.aboutToQuit.connect(self.cleanup)
 
-    #Create a tab in the window to put plots and buttons in
+    # Register a data source once so it can be referenced by id from any tab's plots,
+    # read for the status strip, or evaluated for alarms -- with or without a plot.
+    def add_channel(self, id, label, long_label, filepath, datatype, units, log_interval_s, alarm=None, vmm_num=None):
+        channel = Channel(
+            id=id, label=label, long_label=long_label, filepath=filepath, datatype=datatype,
+            units=units, log_interval_s=log_interval_s, alarm=alarm, vmm_num=vmm_num,
+        )
+        self.channels[id] = channel
+        return channel
+
+    # Create a tab in the window to put plots and buttons in
     def create_tab(self, tab_name, plots_per_row):
-        tab = LiveTab(plots_per_row)
+        tab = LiveTab(plots_per_row, plotter=self)
         self.tab_objects[tab_name] = tab
         self.tabs.addTab(tab, tab_name)
         return tab
 
-    #Call cleanup function for each tab to end all running subprocesses
+    # Call cleanup function for each tab to end all running subprocesses
     def cleanup(self):
         for tab_name in self.tab_objects:
             self.tab_objects[tab_name].cleanup()
-    
+
     # Show the window and start the event loop
     def run(self):
         self.main_window.show()
         sys.exit(self.app.exec_())
 
-class LiveTab(QtWidgets.QWidget):
-    def __init__(self, plots_per_row):
-        super().__init__() # Call the constructor of the parent class (QWidget) to properly initialize the widget. This class is now a custom QTWidget
 
-        '''self.layout = QtWidgets.QGridLayout() ## Create a grid layout manager to arrange child widgets (plots, buttons) in a grid format.
-        self.setLayout(self.layout)'''
+class LiveTab(QtWidgets.QWidget):
+    def __init__(self, plots_per_row, plotter):
+        super().__init__()  # Call the constructor of the parent class (QWidget) to properly initialize the widget. This class is now a custom QTWidget
+
+        self.plotter = plotter  # back-reference, needed to resolve channel ids
 
         # Create a scroll area
         scroll = QtWidgets.QScrollArea()
@@ -74,36 +89,38 @@ class LiveTab(QtWidgets.QWidget):
         self.plots_per_row = plots_per_row
         self.plot_counts = 0
 
-        # Internal state tracking for plots
-        self.data = {}                            # title -> {x: pandas Series, y: pandas Series, buffer_size: int} (list)
-        self.offsets = {}                         # title -> y-offset value (float)
-        self.curves = {}                          # title -> plot curves (list)
-        self.interval_timers = {}                 # title -> QTimer for updates
-        self.elapsed_timers = {}                  # title -> QElapsedTimer for time axis
-        self.running_state = {}                   # title -> bool: is plot running
-        self.start_stop_buttons = {}              # title -> start/stop QPushButton
-        self.data_filepaths = {}                   # title -> data filepaths from logging to pull data from (list)
-        self.datatype = {}                        # Datatype for the plots (e.g., 'pressure', 'temperature')
-        self.vmm_nums = {}                         # title -> VMM numbers (int), only applicable for temperature plots
+        self.plots = {}  # plot_id -> Plot (identity/config/runtime all in one place)
 
-        #Internal state tracking for command buttons
-        self.cmd_buttons = {}                     # title -> QPushButton for terminal commands
-        self.cmd_processes = {}                   # title -> subprocess.Popen object for running commands
-        self.cmd_running_state = {}               # title -> bool: is command running
-        self.cmd_command_strings = {}             # title -> command string (useful if we want to change command on the fly)
+        # Internal state tracking for command buttons (superseded by add_logger_control soon)
+        self.cmd_buttons = {}             # title -> QPushButton for terminal commands
+        self.cmd_processes = {}           # title -> subprocess.Popen object for running commands
+        self.cmd_running_state = {}       # title -> bool: is command running
+        self.cmd_command_strings = {}     # title -> command string (useful if we want to change command on the fly)
+        self.cmd_status_timer = None      # QTimer polling check_command_status, held to prevent garbage collection
 
-        #Internal state tracking for dropdown menus
-        self.dd_menus = {}                        # title ->
-        self.dd_option_names = {}                 # title ->
-        self.dd_option_values = {}                # title ->
-    
+        # Internal state tracking for dropdown menus
+        self.dd_menus = {}
+        self.dd_option_names = {}
+        self.dd_option_values = {}
+
+    def _channel(self, channel_id):
+        return self.plotter.channels[channel_id]
+
     # Add a new plot with button below it
-    def add_plot(self, title, x_axis, y_axis, offset, buffer_size, data_filepaths, datatypes, vmm_nums=None): #x_axis and y_axis are tuples of (label, unit), and buffer_size is the number of data points to display at once
+    def add_plot(self, plot_id, title, channels, x_axis, y_axis, offsets, buffer_size=10, group=None):
+        # x_axis and y_axis are tuples of (label, unit); buffer_size is the number of
+        # data points to display at once (temporary -- superseded by the time-window
+        # selector); channels is a list of channel ids registered via add_channel.
         index = self.plot_counts
         plots_per_row = self.plots_per_row
         self.plot_counts += 1
         row = index // plots_per_row
         col = index % plots_per_row
+
+        plot = Plot(
+            plot_id=plot_id, title=title, channel_ids=list(channels), x_axis=x_axis, y_axis=y_axis,
+            offsets=list(offsets), group=group, buffer_size=buffer_size,
+        )
 
         # Vertical layout to hold the plot and button
         container = QtWidgets.QVBoxLayout()
@@ -113,35 +130,27 @@ class LiveTab(QtWidgets.QWidget):
         plot_widget.setLabel('bottom', x_axis[0], units=x_axis[1])
         plot_widget.setLabel('left', y_axis[0], units=y_axis[1])
         plot_widget.showGrid(x=True, y=True)
+        plot.plot_widget = plot_widget
 
-        #Store the filepath of the data associated with this plot
-        self.data_filepaths[title] = data_filepaths
+        # Color mapping lives in a legend, not in the plot title, whenever a plot
+        # overlays more than one channel.
+        multi_curve = len(plot.channel_ids) > 1
+        if multi_curve:
+            plot_widget.addLegend()
 
-        # Store the datatype for this plot
-        self.datatype[title] = datatypes
-
-        # Store the VMM number for this plot, is None if not applicable
-        self.vmm_nums[title] = vmm_nums
-
-        num_curves = len(data_filepaths)
-        self.data[title] = []
-        self.curves[title] = []
-        COLOR_CYCLE = ['y', 'c', 'm', 'r', 'g', 'b', 'w']
-        for i in range(0, num_curves):
-            # Initialize circular buffers for x and y data
-            empty_data = {"x": pd.Series(np.full(buffer_size, np.nan), name='x'), "y": pd.Series(np.full(buffer_size, np.nan), name='y'), "offset":offset[i], "buffer_size": buffer_size}
-            self.data[title].append(empty_data)
-    
-            # Create the plot curves
+        for i, channel_id in enumerate(plot.channel_ids):
+            channel = self._channel(channel_id)
             color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
-            curve = plot_widget.plot(pen=color)
-            self.curves[title].append(curve)
+            curve = plot_widget.plot(pen=color, name=channel.label if multi_curve else None)
+            plot.curves.append(curve)
+
+        self.plots[plot_id] = plot
 
         # Create the start/stop button
         start_stop_button = QtWidgets.QPushButton(f"Stop {title}")
         start_stop_button.setStyleSheet("background-color: red;")
-        start_stop_button.clicked.connect(lambda _, t=title: self.toggle_plot(t))
-        self.start_stop_buttons[title] = start_stop_button
+        start_stop_button.clicked.connect(lambda _, p=plot_id: self.toggle_plot(p))
+        plot.start_stop_button = start_stop_button
 
         # Add plot and button to vertical container
         container.addWidget(plot_widget)
@@ -150,99 +159,94 @@ class LiveTab(QtWidgets.QWidget):
         # Wrap the layout in a QWidget and add it to the grid
         container_widget = QtWidgets.QWidget()
         container_widget.setLayout(container)
-        container_widget.setMinimumSize(25*16, 40*9)
+        container_widget.setMinimumSize(25 * 16, 40 * 9)
         self.layout.addWidget(container_widget, row, col)
 
+        return plot
+
     # Update function: fetches data from file and updates the plot
-    def update(self, title):
-        num_curves = len(self.data_filepaths[title])
-        for i in range(0, num_curves):
-            x_data, y_data, offset, buffer_size = self.data[title][i]["x"], self.data[title][i]["y"], self.data[title][i]['offset'], self.data[title][i]["buffer_size"]
-            data_filepath = self.data_filepaths[title][i]
-            datatype = self.datatype[title][i]
-            if self.vmm_nums[title] is not None:
-                vmm_num = self.vmm_nums[title][i]
-            else:
-                vmm_num = None
-            
+    def update(self, plot_id):
+        plot = self.plots[plot_id]
+        for i, channel_id in enumerate(plot.channel_ids):
+            channel = self._channel(channel_id)
+            offset = plot.offsets[i]
+
             try:
-                x_data, y_data = get_n_XY_datapoints(data_filepath, buffer_size, datatype, vmm_num)
+                x_data, y_data = get_n_XY_datapoints(channel.filepath, plot.buffer_size, channel.datatype, channel.vmm_num)
             except (pd.errors.ParserError, ValueError) as e:
-                print(f"[{title}] update failed: {e}")
+                print(f"[{plot.title}] update failed: {e}")
                 continue
-            
-            self.curves[title][i].setData(x=x_data, y=y_data+float(offset))
+
+            plot.curves[i].setData(x=x_data, y=y_data + float(offset))
 
     # Return elapsed time in seconds since the plot started
-    def get_elapsed_time(self, title):
-        return self.elapsed_timers[title].elapsed() / 1000.0 #convert ms to seconds
+    def get_elapsed_time(self, plot_id):
+        return self.plots[plot_id].elapsed_timer.elapsed() / 1000.0  # convert ms to seconds
 
     # Starts the QTimer that drives the updates for a given plot
-    def start_timer(self, title, interval_ms):
+    def start_timer(self, plot_id, interval_ms):
+        plot = self.plots[plot_id]
+
         # Create a timer to update the plot regularly
         timer = QtCore.QTimer()
-        timer.timeout.connect(lambda: self.update(title))
+        timer.timeout.connect(lambda: self.update(plot_id))
         timer.start(interval_ms)
-        self.interval_timers[title] = timer
+        plot.interval_timer = timer
 
         # Start a timer to track elapsed time
         elapsed = QtCore.QElapsedTimer()
         elapsed.start()
-        self.elapsed_timers[title] = elapsed
+        plot.elapsed_timer = elapsed
 
         # Mark the plot as running
-        self.running_state[title] = True
+        plot.running = True
 
     # Toggle between start and stop for a given plot
-    def toggle_plot(self, title):
-        if self.running_state[title]:
+    def toggle_plot(self, plot_id):
+        plot = self.plots[plot_id]
+        if plot.running:
             # Stop the timer and update the button text
-            self.interval_timers[title].stop()
-            self.start_stop_buttons[title].setText(f"Start {title}")
-            self.start_stop_buttons[title].setStyleSheet("background-color: green;")
-            self.running_state[title] = False
+            plot.interval_timer.stop()
+            plot.start_stop_button.setText(f"Start {plot.title}")
+            plot.start_stop_button.setStyleSheet("background-color: green;")
+            plot.running = False
         else:
-            # Reset data and timer, restart updates
-            num_curves = len(self.data_filepaths[title])
-            for i in range(0, num_curves):
-                buffer_size = self.data[title][i]["buffer_size"]
-                offset = self.data[title][i]["offset"]
-                self.data[title][i] = {"x": pd.Series(np.full(buffer_size, np.nan), name='x'), "y": pd.Series(np.full(buffer_size, np.nan), name='y'), "offset":offset, "buffer_size": buffer_size}
-            self.elapsed_timers[title].restart()
-            self.interval_timers[title].start()
-            self.start_stop_buttons[title].setText(f"Stop {title}")
-            self.start_stop_buttons[title].setStyleSheet("background-color: red;")
-            self.running_state[title] = True
+            # Restart updates
+            plot.elapsed_timer.restart()
+            plot.interval_timer.start()
+            plot.start_stop_button.setText(f"Stop {plot.title}")
+            plot.start_stop_button.setStyleSheet("background-color: red;")
+            plot.running = True
 
-    #Run a terminal command using subprocess
+    # Run a terminal command using subprocess
     def run_terminal_command(self, title, command):
         system = platform.system()
 
         if system == 'Windows':
-            #Use shlex.split to safely split the command respecting shell syntax
+            # Use shlex.split to safely split the command respecting shell syntax
             cmd_parts = shlex.split(command, posix=False)  # Use posix=False for Windows compatibility
-            process = subprocess.Popen(cmd_parts, shell=True) #Use shell=True for Windows to handle commands correctly
+            process = subprocess.Popen(cmd_parts, shell=True)  # Use shell=True for Windows to handle commands correctly
         else:
             cmd_parts = shlex.split(command)
             process = subprocess.Popen(cmd_parts)
-        
+
         self.cmd_processes[title] = process
-    
-    #Terminate a running terminal command
+
+    # Terminate a running terminal command
     def stop_terminal_command(self, title):
         process = self.cmd_processes[title]
 
-        #Check if the process is still running and terminate it
+        # Check if the process is still running and terminate it
         if process and process.poll() is None:
             system = platform.system()
             if system == 'Windows':
                 subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], check=True)
             else:
                 process.kill()
-    
-    #Handle button click for starting/stopping terminal commands
+
+    # Handle button click for starting/stopping terminal commands
     def cmd_button_clicked(self, title):
-        command = self.cmd_command_strings[title] #this method allows us to dynamically change the command if necessary
+        command = self.cmd_command_strings[title]  # this method allows us to dynamically change the command if necessary
         if self.cmd_running_state[title]:
             # If the command is running, stop it
             self.stop_terminal_command(title)
@@ -261,7 +265,7 @@ class LiveTab(QtWidgets.QWidget):
             cmd_button.setStyleSheet("background-color: red;")
 
             self.cmd_running_state[title] = True
-        
+
     # Add a button that runs a terminal command on click
     def add_command_button(self, title, command):
         index = self.plot_counts
@@ -275,7 +279,7 @@ class LiveTab(QtWidgets.QWidget):
 
         # Create button
         cmd_button = QtWidgets.QPushButton(f'Start {title}')
-        cmd_button.setStyleSheet(f"background-color: green;")
+        cmd_button.setStyleSheet("background-color: green;")
         self.cmd_command_strings[title] = command
         cmd_button.clicked.connect(lambda _, t=title: self.cmd_button_clicked(t))
         self.cmd_buttons[title] = cmd_button
@@ -290,7 +294,7 @@ class LiveTab(QtWidgets.QWidget):
 
         # Mark the command as not running
         self.cmd_running_state[title] = False
-    
+
     # Check the status of all command processes and update button states
     def check_command_status(self):
         for title in self.cmd_processes:
@@ -301,15 +305,15 @@ class LiveTab(QtWidgets.QWidget):
                 cmd_button.setText(f'Start {title}')
                 cmd_button.setStyleSheet("background-color: green;")
                 self.cmd_running_state[title] = False
-    
+
     def cmd_timer(self, interval_ms):
         # Create a timer to check command status on a regular interval
         timer = QtCore.QTimer()
         timer.timeout.connect(lambda: self.check_command_status())
         timer.start(interval_ms)
-        self.interval_timers['cmd_timer'] = timer #Store primarily to prevent garbage collection
-    
-    #Add a dropdown menu with specified options and values attached to the options
+        self.cmd_status_timer = timer  # held to prevent garbage collection
+
+    # Add a dropdown menu with specified options and values attached to the options
     def add_dropdown_menu(self, title, option_names, option_values, ctrl_var=None, on_change_callback=None):
         index = self.plot_counts
         plots_per_row = self.plots_per_row
@@ -348,15 +352,15 @@ class LiveTab(QtWidgets.QWidget):
         # Wrap the layout in a QWidget and add it to the grid
         container_widget = QtWidgets.QWidget()
         container_widget.setLayout(container)
-        container_widget.setMaximumWidth(500) #prevent stretching (aesthetics)
+        container_widget.setMaximumWidth(500)  # prevent stretching (aesthetics)
         self.layout.addWidget(container_widget, row, col)
 
-    #Changes the command string associated with a specified command button based on the title of the button
+    # Changes the command string associated with a specified command button based on the title of the button
     def change_cmd_button_command(self, title, new_command):
         self.cmd_command_strings[title] = new_command
-    
-    #Specialized function specifically for the 40L TPC commands, will likely not be useful for a general user of this program
-    #People using this program for a different use case will need to edit this function and/or write a new one to do the editing they need to the command string
+
+    # Specialized function specifically for the 40L TPC commands, will likely not be useful for a general user of this program
+    # People using this program for a different use case will need to edit this function and/or write a new one to do the editing they need to the command string
     def change_cmd(self, title, ctrl_title, dropdown_text, new_option_value):
         old_command = self.cmd_command_strings[ctrl_title]
 
@@ -365,24 +369,16 @@ class LiveTab(QtWidgets.QWidget):
 
         new_command = ' '.join(parts)
 
-        print(f'New Command: {new_command}') #for debugging
+        print(f'New Command: {new_command}')  # for debugging
 
         self.change_cmd_button_command(ctrl_title, new_command)
-    
-    #Change the buffer size of a specified plot, intended to be attached to a dropdown menu
-    def change_buffer_size(self, title, ctrl_title, dropdown_text, new_option_value):
-        num_curves = len(self.data_filepaths[ctrl_title])
-        for i in range(0, num_curves):
-            self.data[i][ctrl_title]["buffer_size"] = new_option_value
 
-    #Change the buffer size of multiple plots at once, intended to be attached to a dropdown menu
-    #ctrl_titles is a list of titles that correspond to the plots to change
-    def change_buffer_size_multiple(self, title, ctrl_titles, dropdown_text, new_option_value):
-        for i in range(len(ctrl_titles)):
-            num_curves = len(self.data_filepaths[str(ctrl_titles[i])])
-            for l in range(0, num_curves):
-                self.data[str(ctrl_titles[i])][l]["buffer_size"] = new_option_value
-    
+    # Change the buffer size of multiple plots at once, intended to be attached to a dropdown menu.
+    # ctrl_plot_ids is a list of plot_ids that correspond to the plots to change.
+    def change_buffer_size_multiple(self, title, ctrl_plot_ids, dropdown_text, new_option_value):
+        for plot_id in ctrl_plot_ids:
+            self.plots[str(plot_id)].buffer_size = new_option_value
+
     # End all running subprocesses
     def cleanup(self):
         for title in self.cmd_processes:

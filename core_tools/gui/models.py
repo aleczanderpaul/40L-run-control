@@ -1,0 +1,44 @@
+from dataclasses import dataclass, field
+
+from core_tools.alarms import AlarmSpec
+
+'''Declarative data model for channels and plots.
+
+A "channel" is a named data source (a file + a column/datatype to pull out of it).
+A "plot" is a visual display of one or more channels sharing a set of axes. Channels
+are registered once on the LivePlotter (so they can be read for the status strip and
+alarm evaluation even without a plot); plots reference channels by id.
+'''
+
+
+@dataclass
+class Channel:
+    id: str
+    label: str
+    long_label: str
+    filepath: str
+    datatype: str
+    units: str
+    log_interval_s: float
+    alarm: AlarmSpec | None = None
+    vmm_num: int | None = None
+
+
+@dataclass
+class Plot:
+    plot_id: str
+    title: str
+    channel_ids: list[str]
+    x_axis: tuple[str, str]
+    y_axis: tuple[str, str]
+    offsets: list[float]
+    group: str | None = None
+    buffer_size: int = 10  # TEMPORARY: superseded by the time-window selector (see §7)
+
+    # Runtime state, populated by LiveTab.add_plot() and mutated as the plot runs.
+    plot_widget: object = None
+    curves: list = field(default_factory=list)
+    start_stop_button: object = None
+    interval_timer: object = None
+    elapsed_timer: object = None
+    running: bool = False
