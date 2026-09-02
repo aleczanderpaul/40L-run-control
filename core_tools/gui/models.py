@@ -38,10 +38,13 @@ class Plot:
     # Runtime state, populated by LiveTab.add_plot() and mutated as the plot runs.
     plot_widget: object = None
     curves: list = field(default_factory=list)
-    start_stop_button: object = None
+    value_labels: list = field(default_factory=list)   # one per channel, in channel_ids order
+    threshold_lines: list = field(default_factory=list)
+    pause_button: object = None
     interval_timer: object = None
     elapsed_timer: object = None
     running: bool = False
+    in_alarm_visual: bool = False  # tracks current border/title styling so we only touch Qt state on change
 
 
 @dataclass

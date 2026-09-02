@@ -1,6 +1,7 @@
 from pyqtgraph.Qt import QtWidgets, QtCore
 import pyqtgraph as pg
 import sys
+import time
 import pandas as pd
 import subprocess
 import threading
@@ -9,12 +10,22 @@ import serial.tools.list_ports
 
 from .get_data_for_GUI import get_n_XY_datapoints
 from .models import Channel, Plot, LoggerControl
+from core_tools.alarms import AlarmEvaluator, AlarmState, DisplayStatus, display_status
 
 '''Class to handle live plotting and add various controls/buttons in a Qt GUI application.'''
 
 COLOR_CYCLE = ['y', 'c', 'm', 'r', 'g', 'b', 'w']
 
 LED_COLORS = {'running': '#2ecc71', 'stopped': '#95a5a6', 'crashed': '#e74c3c'}
+ALARM_COLOR = '#e74c3c'
+
+# How often the alarm scanner reads every registered channel and how many trailing
+# rows it fetches per read. Deliberately independent of any plot's own timer (a
+# paused plot must not pause its channels' alarm evaluation) and, for now,
+# independent of the per-plot update() reads too -- both re-read from disk until the
+# shared data cache lands, which is a known, temporary duplication of file reads.
+ALARM_SCAN_INTERVAL_MS = 1000
+ALARM_LOOKBACK_ROWS = 50
 
 
 class LivePlotter:
@@ -45,6 +56,15 @@ class LivePlotter:
 
         self.tab_objects = {}  # tab_name -> LiveTab object
         self.channels = {}     # channel_id -> Channel, registered once, shared across all tabs
+        self.channel_plots = {}  # channel_id -> [(LiveTab, plot_id), ...], for alarm-driven visuals
+
+        # Alarm evaluation is driven by one scanner timer here, independent of any
+        # plot's own timer/pause state (see core_tools/alarms.py and §4.4).
+        self.alarm_evaluator = AlarmEvaluator()
+        self._alarm_last_ts = {}  # channel_id -> newest absolute timestamp already evaluated
+        self.alarm_scan_timer = QtCore.QTimer()
+        self.alarm_scan_timer.timeout.connect(self._scan_alarms)
+        self.alarm_scan_timer.start(ALARM_SCAN_INTERVAL_MS)
 
         # Calls the cleanup function when the application is about to quit so that all running subprocesses are terminated
         self.app.aboutToQuit.connect(self.cleanup)
@@ -58,6 +78,82 @@ class LivePlotter:
         )
         self.channels[id] = channel
         return channel
+
+    # Read every registered channel's recent rows, feed the newly-arrived ones (not
+    # just the newest) through the alarm evaluator, and refresh every plot's value
+    # readout/border from the result. Runs regardless of which plots are paused or
+    # which tab is selected.
+    def _scan_alarms(self):
+        now = time.time()
+        for channel_id, channel in self.channels.items():
+            try:
+                times_ago, values = get_n_XY_datapoints(channel.filepath, ALARM_LOOKBACK_ROWS, channel.datatype, channel.vmm_num)
+            except (pd.errors.ParserError, ValueError, FileNotFoundError, OSError):
+                continue  # can't read right now (e.g. an external logger hasn't written yet) -- retry next tick
+
+            last_seen = self._alarm_last_ts.get(channel_id)
+            newest_ts = last_seen
+            samples = []
+            for seconds_ago, value in zip(times_ago, values):
+                ts = now + float(seconds_ago)
+                if newest_ts is None or ts > newest_ts:
+                    newest_ts = ts
+                if last_seen is None or ts > last_seen:
+                    samples.append((ts, float(value)))
+            samples.sort(key=lambda s: s[0])
+
+            self.alarm_evaluator.evaluate_channel(channel_id, channel.alarm, samples, now, channel.log_interval_s)
+            if newest_ts is not None:
+                self._alarm_last_ts[channel_id] = newest_ts
+
+        self._refresh_alarm_visuals(now)
+
+    def _refresh_alarm_visuals(self, now):
+        for channel_id, refs in self.channel_plots.items():
+            channel = self.channels[channel_id]
+            state = self.alarm_evaluator.state_for(channel_id)
+            status = display_status(state)
+            for tab, plot_id in refs:
+                plot = tab.plots[plot_id]
+                idx = plot.channel_ids.index(channel_id)
+                self._style_value_label(plot.value_labels[idx], channel, state, status, plot.offsets[idx], now)
+
+        for tab in self.tab_objects.values():
+            for plot in tab.plots.values():
+                any_alarm = any(self.alarm_evaluator.state_for(cid).state == AlarmState.ALARM for cid in plot.channel_ids)
+                self._set_plot_alarm_border(plot, any_alarm)
+
+    def _style_value_label(self, label, channel, state, status, offset, now):
+        value = state.last_value
+        if value is None or value != value:  # NaN-safe for any numeric type (NaN != NaN)
+            label.setText(f"{channel.label}: —")
+            label.setStyleSheet("color: grey;")
+            return
+
+        displayed = value + offset
+        text = f"{channel.label}: {displayed:.3g} {channel.units}"
+        if status == DisplayStatus.ALARM:
+            label.setStyleSheet(f"color: {ALARM_COLOR}; font-weight: bold;")
+        elif status == DisplayStatus.STALE:
+            age = (now - state.last_timestamp) if state.last_timestamp else 0
+            text += f" (stale {age:.0f}s)"
+            label.setStyleSheet("color: grey;")
+        elif status == DisplayStatus.CLEARED:
+            label.setStyleSheet("color: #b8860b;")
+        else:
+            label.setStyleSheet("")
+        label.setText(text)
+
+    def _set_plot_alarm_border(self, plot, in_alarm):
+        if in_alarm == plot.in_alarm_visual:
+            return
+        plot.in_alarm_visual = in_alarm
+        if in_alarm:
+            plot.plot_widget.setStyleSheet(f"border: 2px solid {ALARM_COLOR};")
+            plot.plot_widget.setTitle(plot.title, color=ALARM_COLOR)
+        else:
+            plot.plot_widget.setStyleSheet("")
+            plot.plot_widget.setTitle(plot.title)
 
     # Create a tab in the window to put plots and buttons in
     def create_tab(self, tab_name, plots_per_row):
@@ -110,7 +206,24 @@ class LiveTab(QtWidgets.QWidget):
     def _channel(self, channel_id):
         return self.plotter.channels[channel_id]
 
-    # Add a new plot with button below it
+    @staticmethod
+    def _threshold_line_values(alarm):
+        if alarm is None:
+            return []
+        values = []
+        if alarm.high is not None:
+            values.append(alarm.high)
+        if alarm.low is not None:
+            values.append(alarm.low)
+        if alarm.abs_high is not None:
+            values.append(alarm.abs_high)
+            values.append(-alarm.abs_high)
+        return values
+
+    # Add a new plot. Its header row carries one current-value readout per channel
+    # (kept live by the alarm scanner, so it still reflects reality while the plot
+    # itself is paused) plus a small pause toggle, replacing the old full-width
+    # "Stop <title>" button.
     def add_plot(self, plot_id, title, channels, x_axis, y_axis, offsets, buffer_size=10, group=None):
         # x_axis and y_axis are tuples of (label, unit); buffer_size is the number of
         # data points to display at once (temporary -- superseded by the time-window
@@ -126,8 +239,21 @@ class LiveTab(QtWidgets.QWidget):
             offsets=list(offsets), group=group, buffer_size=buffer_size,
         )
 
-        # Vertical layout to hold the plot and button
         container = QtWidgets.QVBoxLayout()
+
+        header_row = QtWidgets.QHBoxLayout()
+        for channel_id in plot.channel_ids:
+            value_label = QtWidgets.QLabel(f"{self._channel(channel_id).label}: —")
+            header_row.addWidget(value_label)
+            plot.value_labels.append(value_label)
+        header_row.addStretch(1)
+        pause_button = QtWidgets.QPushButton("⏸")
+        pause_button.setFixedWidth(28)
+        pause_button.setToolTip(f"Pause {title}")
+        pause_button.clicked.connect(lambda _, p=plot_id: self.toggle_plot(p))
+        plot.pause_button = pause_button
+        header_row.addWidget(pause_button)
+        container.addLayout(header_row)
 
         # Create the plot widget
         plot_widget = pg.PlotWidget(title=title)
@@ -148,17 +274,20 @@ class LiveTab(QtWidgets.QWidget):
             curve = plot_widget.plot(pen=color, name=channel.label if multi_curve else None)
             plot.curves.append(curve)
 
+            # Threshold lines are drawn offset-corrected so they still line up
+            # visually with the (offset-corrected) trace, even though alarm
+            # evaluation itself always uses the raw, un-offset value.
+            offset = plot.offsets[i]
+            for line_value in self._threshold_line_values(channel.alarm):
+                line = pg.InfiniteLine(pos=line_value + offset, angle=0, pen=pg.mkPen(ALARM_COLOR, style=QtCore.Qt.DashLine))
+                plot_widget.addItem(line)
+                plot.threshold_lines.append(line)
+
+            self.plotter.channel_plots.setdefault(channel_id, []).append((self, plot_id))
+
         self.plots[plot_id] = plot
 
-        # Create the start/stop button
-        start_stop_button = QtWidgets.QPushButton(f"Stop {title}")
-        start_stop_button.setStyleSheet("background-color: red;")
-        start_stop_button.clicked.connect(lambda _, p=plot_id: self.toggle_plot(p))
-        plot.start_stop_button = start_stop_button
-
-        # Add plot and button to vertical container
         container.addWidget(plot_widget)
-        container.addWidget(start_stop_button)
 
         # Wrap the layout in a QWidget and add it to the grid
         container_widget = QtWidgets.QWidget()
@@ -205,21 +334,21 @@ class LiveTab(QtWidgets.QWidget):
         # Mark the plot as running
         plot.running = True
 
-    # Toggle between start and stop for a given plot
+    # Toggle between running and paused for a given plot. This only stops/starts the
+    # curve redraw -- the channel's alarm evaluation is driven entirely by
+    # LivePlotter's independent scanner timer and keeps running regardless (§4.4).
     def toggle_plot(self, plot_id):
         plot = self.plots[plot_id]
         if plot.running:
-            # Stop the timer and update the button text
             plot.interval_timer.stop()
-            plot.start_stop_button.setText(f"Start {plot.title}")
-            plot.start_stop_button.setStyleSheet("background-color: green;")
+            plot.pause_button.setText("▶")
+            plot.pause_button.setToolTip(f"Resume {plot.title}")
             plot.running = False
         else:
-            # Restart updates
             plot.elapsed_timer.restart()
             plot.interval_timer.start()
-            plot.start_stop_button.setText(f"Stop {plot.title}")
-            plot.start_stop_button.setStyleSheet("background-color: red;")
+            plot.pause_button.setText("⏸")
+            plot.pause_button.setToolTip(f"Pause {plot.title}")
             plot.running = True
 
     # Register a logger's controls (LED, port, interval, start/stop) in the shared
