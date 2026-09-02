@@ -450,6 +450,7 @@ class LiveTab(QtWidgets.QWidget):
         header_row = QtWidgets.QHBoxLayout()
         for channel_id in plot.channel_ids:
             value_label = QtWidgets.QLabel(f"{self._channel(channel_id).label}: —")
+            value_label.setWordWrap(True)  # wrap instead of visually clipping when a multi-channel plot's combined text is wide
             header_row.addWidget(value_label)
             plot.value_labels.append(value_label)
         header_row.addStretch(1)
@@ -500,7 +501,7 @@ class LiveTab(QtWidgets.QWidget):
         # tab's flat grid if ungrouped) -- see _grid_for_group().
         container_widget = QtWidgets.QWidget()
         container_widget.setLayout(container)
-        container_widget.setMinimumSize(300, 220)
+        container_widget.setMinimumSize(320, 300)
         grid, index = self._grid_for_group(group)
         row, col = index // self.plots_per_row, index % self.plots_per_row
         grid.addWidget(container_widget, row, col)
@@ -865,6 +866,10 @@ class StatusStrip(QtWidgets.QWidget):
             heading = spec.label if isinstance(spec, AggregateTile) else self.plotter.channels[spec].label
             box.addWidget(QtWidgets.QLabel(heading))
             value_label = QtWidgets.QLabel('—')
+            # This tile sits directly in main_layout (no scroll area above it), so an
+            # unwrapped label's full-text-width minimumSizeHint would otherwise
+            # become a hard floor under the whole window -- see AlarmBanner.
+            value_label.setWordWrap(True)
             box.addWidget(value_label)
 
             frame.mousePressEvent = lambda event, s=spec: self._on_clicked(s)
@@ -935,6 +940,13 @@ class AlarmBanner(QtWidgets.QWidget):
 
         self.message_label = QtWidgets.QLabel('')
         self.message_label.setStyleSheet("font-weight: bold;")
+        # A QLabel without word wrap has a minimumSizeHint equal to its full
+        # (single-line) text width -- and Qt's layout-minimum-size constraint
+        # overrides "maximized" window state. Since this label sits directly in
+        # main_layout (not inside any scroll area) and its text length varies with
+        # whatever alarm is currently active, an unwrapped long message could force
+        # the whole window wider than any real screen the instant it appeared.
+        self.message_label.setWordWrap(True)
         self.message_label.mousePressEvent = self._on_message_clicked
         self.layout.addWidget(self.message_label, 1)
 
@@ -1148,6 +1160,7 @@ class OverviewTab(QtWidgets.QWidget):
 
         vbox.addWidget(QtWidgets.QLabel(channel.label))
         value_label = QtWidgets.QLabel('—')
+        value_label.setWordWrap(True)  # cheap insurance against the same unwrapped-label minimum-width issue as the banner/status strip
         vbox.addWidget(value_label)
 
         sparkline = pg.PlotWidget()
@@ -1289,6 +1302,7 @@ class VMMTab(QtWidgets.QWidget):
 
         value_label = QtWidgets.QLabel('—')
         value_label.setStyleSheet("font-size: 10px;")
+        value_label.setWordWrap(True)  # VMMTab has no scroll area, so an unwrapped label here would push the window wider -- see AlarmBanner
         row.addWidget(value_label)
         row.addStretch(1)
 
