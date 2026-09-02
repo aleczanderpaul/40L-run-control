@@ -198,6 +198,8 @@ class LivePlotter:
                 self._style_value_label(plot.value_labels[idx], channel, state, status, plot.offsets[idx], now)
 
         for tab in self.tab_objects.values():
+            if not isinstance(tab, LiveTab):
+                continue  # only LiveTab owns Plot objects with a border to color
             for plot in tab.plots.values():
                 any_alarm = any(self.alarm_evaluator.state_for(cid).state == AlarmState.ALARM for cid in plot.channel_ids)
                 self._set_plot_alarm_border(plot, any_alarm)
@@ -207,15 +209,13 @@ class LivePlotter:
         self._refresh_tab_badges()
         if self.overview_tab is not None:
             self.overview_tab.refresh_values(now)
+        for tab in self.tab_objects.values():
+            if isinstance(tab, VMMTab):
+                tab.refresh(now)
 
     def _refresh_tab_badges(self):
         for tab_name, tab in self.tab_objects.items():
-            alarming = set()
-            for plot in tab.plots.values():
-                for channel_id in plot.channel_ids:
-                    status = display_status(self.alarm_evaluator.state_for(channel_id))
-                    if status in (DisplayStatus.ALARM, DisplayStatus.STALE):
-                        alarming.add(channel_id)
+            alarming = tab.alarming_channel_ids(self.alarm_evaluator)
             index = self.tabs.indexOf(tab)
             if index < 0:
                 continue
@@ -276,6 +276,16 @@ class LivePlotter:
         self.tabs.addTab(tab, tab_name)
         return tab
 
+    # VMM Temperatures tab: a 4x4 tile grid (one per channel, with a checkbox) beside
+    # one overlay plot showing every checked channel's curve. threshold=None derives
+    # the single threshold line from the first channel with alarm.high configured.
+    def build_vmm_tab(self, tab_name, channel_ids, threshold=None):
+        tab = VMMTab(self, channel_ids, threshold=threshold)
+        tab.tab_name = tab_name
+        self.tab_objects[tab_name] = tab
+        self.tabs.addTab(tab, tab_name)
+        return tab
+
     # End all running logger subprocesses
     def cleanup(self):
         self._save_layout()
@@ -323,6 +333,16 @@ class LiveTab(QtWidgets.QWidget):
 
     def _channel(self, channel_id):
         return self.plotter.channels[channel_id]
+
+    # Distinct channels across this tab's plots currently in ALARM/STALE -- used for
+    # the tab-label badge (§4.6.4).
+    def alarming_channel_ids(self, evaluator):
+        result = set()
+        for plot in self.plots.values():
+            for channel_id in plot.channel_ids:
+                if display_status(evaluator.state_for(channel_id)) in (DisplayStatus.ALARM, DisplayStatus.STALE):
+                    result.add(channel_id)
+        return result
 
     @staticmethod
     def _threshold_line_values(alarm):
@@ -981,7 +1001,6 @@ class OverviewTab(QtWidgets.QWidget):
     def __init__(self, plotter):
         super().__init__()
         self.plotter = plotter
-        self.plots = {}  # always empty -- duck-types as a tab for _refresh_tab_badges()
         self.tiles = []  # [{'channel_id', 'frame', 'value_label', 'curve'}, ...]
 
         scroll = QtWidgets.QScrollArea()
@@ -1041,6 +1060,9 @@ class OverviewTab(QtWidgets.QWidget):
 
         return {'channel_id': channel.id, 'frame': frame, 'value_label': value_label, 'curve': curve}
 
+    def alarming_channel_ids(self, evaluator):
+        return set()  # Overview never gets its own badge (§4.6.4 only shows one on VMM Temperatures in the mockup)
+
     def refresh_values(self, now):
         for tile in self.tiles:
             channel = self.plotter.channels[tile['channel_id']]
@@ -1060,3 +1082,150 @@ class OverviewTab(QtWidgets.QWidget):
             except (pd.errors.ParserError, ValueError, FileNotFoundError, OSError):
                 continue
             tile['curve'].setData(x=x_data, y=y_data)
+
+
+class VMMTab(QtWidgets.QWidget):
+    '''Replaces the wall of 16 individual plots with a 4x4 tile grid (checkbox +
+    current value + alarm color) beside one overlay plot of every checked channel.'''
+
+    BUFFER_SIZE = 300  # temporary, until the time-window selector lands
+    UPDATE_INTERVAL_MS = 1000
+
+    def __init__(self, plotter, channel_ids, threshold=None):
+        super().__init__()
+        self.plotter = plotter
+        self.channel_ids = list(channel_ids)
+        self.tiles = {}   # channel_id -> {'frame', 'checkbox', 'value_label'}
+        self.curves = {}  # channel_id -> PlotDataItem
+        self._colors = {}  # channel_id -> assigned pen color, so alarm highlighting can revert to it
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+
+        left_widget = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout()
+        left_widget.setLayout(left_layout)
+        grid = QtWidgets.QGridLayout()
+        columns = 4
+        for i, channel_id in enumerate(self.channel_ids):
+            tile = self._build_tile(channel_id)
+            grid.addWidget(tile['frame'], i // columns, i % columns)
+            self.tiles[channel_id] = tile
+        left_layout.addLayout(grid)
+        left_layout.addStretch(1)
+        splitter.addWidget(left_widget)
+
+        right_widget = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout()
+        right_widget.setLayout(right_layout)
+
+        controls_row = QtWidgets.QHBoxLayout()
+        select_all_button = QtWidgets.QPushButton('Select All')
+        select_all_button.clicked.connect(self.select_all)
+        controls_row.addWidget(select_all_button)
+        select_none_button = QtWidgets.QPushButton('Select None')
+        select_none_button.clicked.connect(self.select_none)
+        controls_row.addWidget(select_none_button)
+        controls_row.addStretch(1)
+        right_layout.addLayout(controls_row)
+
+        self.overlay_widget = pg.PlotWidget(title='VMM Temperatures Overlay')
+        self.overlay_widget.setLabel('bottom', 'Time since present', units='s')
+        self.overlay_widget.setLabel('left', 'Temperature', units='degC')
+        self.overlay_widget.showGrid(x=True, y=True)
+        self.overlay_widget.addLegend()
+        right_layout.addWidget(self.overlay_widget)
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+
+        if threshold is None:
+            for channel_id in self.channel_ids:
+                alarm = self.plotter.channels[channel_id].alarm
+                if alarm is not None and alarm.high is not None:
+                    threshold = alarm.high
+                    break
+        if threshold is not None:
+            line = pg.InfiniteLine(pos=threshold, angle=0, pen=pg.mkPen(ALARM_COLOR, style=QtCore.Qt.DashLine))
+            self.overlay_widget.addItem(line)
+
+        for i, channel_id in enumerate(self.channel_ids):
+            channel = self.plotter.channels[channel_id]
+            color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
+            self._colors[channel_id] = color
+            self.curves[channel_id] = self.overlay_widget.plot(pen=color, name=channel.label)
+
+        outer_layout = QtWidgets.QVBoxLayout()
+        outer_layout.addWidget(splitter)
+        self.setLayout(outer_layout)
+
+        self._update_timer = QtCore.QTimer()
+        self._update_timer.timeout.connect(self._update_curves)
+        self._update_timer.start(self.UPDATE_INTERVAL_MS)
+        self._update_curves()
+
+    def _build_tile(self, channel_id):
+        channel = self.plotter.channels[channel_id]
+        fec, remainder = divmod(channel.vmm_num, 8)
+        hyb, vmm = divmod(remainder, 2)
+
+        frame = QtWidgets.QFrame()
+        frame.setFrameShape(QtWidgets.QFrame.Box)
+        vbox = QtWidgets.QVBoxLayout()
+        frame.setLayout(vbox)
+
+        top_row = QtWidgets.QHBoxLayout()
+        checkbox = QtWidgets.QCheckBox()
+        checkbox.setChecked(True)
+        checkbox.stateChanged.connect(lambda state, cid=channel_id: self._on_checkbox_changed(cid, state))
+        top_row.addWidget(checkbox)
+        top_row.addWidget(QtWidgets.QLabel(f"VMM {channel.vmm_num} (F{fec}/H{hyb}/V{vmm})"))
+        vbox.addLayout(top_row)
+
+        value_label = QtWidgets.QLabel('—')
+        vbox.addWidget(value_label)
+
+        return {'frame': frame, 'checkbox': checkbox, 'value_label': value_label}
+
+    def _on_checkbox_changed(self, channel_id, state):
+        self.curves[channel_id].setVisible(state == QtCore.Qt.Checked)
+
+    def select_all(self):
+        for tile in self.tiles.values():
+            tile['checkbox'].setChecked(True)
+
+    def select_none(self):
+        for tile in self.tiles.values():
+            tile['checkbox'].setChecked(False)
+
+    def alarming_channel_ids(self, evaluator):
+        return {cid for cid in self.channel_ids if display_status(evaluator.state_for(cid)) in (DisplayStatus.ALARM, DisplayStatus.STALE)}
+
+    # Tile value/color, auto-check + curve highlight on ALARM entry. Called every
+    # alarm-scan tick, same as the status strip/overview/per-plot readouts.
+    def refresh(self, now):
+        for channel_id, tile in self.tiles.items():
+            channel = self.plotter.channels[channel_id]
+            state = self.plotter.alarm_evaluator.state_for(channel_id)
+            status = display_status(state)
+
+            text, style = format_channel_value(channel, state, status, offset=0.0, now=now)
+            tile['value_label'].setText(text)
+            tile['value_label'].setStyleSheet(style)
+            tile['frame'].setStyleSheet(f"border: 2px solid {ALARM_COLOR};" if state.state == AlarmState.ALARM else "")
+
+            curve = self.curves[channel_id]
+            if state.state == AlarmState.ALARM:
+                curve.setPen(pg.mkPen(ALARM_COLOR, width=3))
+                if not tile['checkbox'].isChecked():
+                    tile['checkbox'].setChecked(True)  # emits stateChanged -> curve becomes visible
+            else:
+                curve.setPen(pg.mkPen(self._colors[channel_id], width=1))
+
+    def _update_curves(self):
+        for channel_id in self.channel_ids:
+            channel = self.plotter.channels[channel_id]
+            try:
+                x_data, y_data = get_n_XY_datapoints(channel.filepath, self.BUFFER_SIZE, channel.datatype, channel.vmm_num)
+            except (pd.errors.ParserError, ValueError, FileNotFoundError, OSError):
+                continue
+            self.curves[channel_id].setData(x=x_data, y=y_data)

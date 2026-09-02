@@ -24,7 +24,6 @@ filter_line_gas_flow_offset = 0
 filter_line_pressure_offset = 0
 filter_line_temperature_offset = 0
 filter_line_H2O_offset = 0
-vmm_temperatures_offset = 0
 
 interval_time_ms = 1000
 num_vmms = 16
@@ -125,19 +124,9 @@ pressure_tab.add_logger_control(id='log_h2o', label='H2O Concentration', script=
 
 pressure_tab.add_dropdown_menu(title='# data points shown', option_names=['10', '50', '100', '1000', '10000', '100000'], option_values=[10, 50, 100, 1000, 10000, 100000], ctrl_var=pressure_ctrl_plot_ids, on_change_callback=pressure_tab.change_buffer_size_multiple)
 
-'''VMM TEMPERATURES TAB'''
-temp_tab = plotter.create_tab(tab_name='VMM Temperatures', plots_per_row=4)
-
-#VMM temperature tab plots
-vmm_plot_ids = []
-for i in range(num_vmms):
-    plot_id = f'vmm_temp_{i}'
-    temp_tab.add_plot(plot_id=plot_id, title=f'VMM {i} Temperature', channels=[plot_id],
-                       x_axis=('Time since present', 's'), y_axis=('Temperature', 'degC'),
-                       offsets=[vmm_temperatures_offset], buffer_size=10)
-    temp_tab.start_timer(plot_id=plot_id, interval_ms=interval_time_ms)
-    vmm_plot_ids.append(plot_id)
-temp_tab.add_dropdown_menu(title='# data points shown', option_names=['10', '50', '100', '1000', '10000'], option_values=[10, 50, 100, 1000, 10000], ctrl_var=vmm_plot_ids, on_change_callback=temp_tab.change_buffer_size_multiple)
+'''VMM TEMPERATURES TAB -- tile grid + one overlay plot (§5.4), not 16 separate plots'''
+vmm_plot_ids = [f'vmm_temp_{i}' for i in range(num_vmms)]
+temp_tab = plotter.build_vmm_tab('VMM Temperatures', vmm_plot_ids)
 
 '''STATUS STRIP -- always visible above the tabs, regardless of which one is selected'''
 plotter.set_status_strip([
