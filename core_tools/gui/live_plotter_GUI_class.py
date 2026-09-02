@@ -279,11 +279,18 @@ class LivePlotter:
     # used by status-strip/overview tile clicks and the alarm banner's message.
     def jump_to_channel(self, channel_id):
         refs = self.channel_plots.get(channel_id, [])
-        if not refs:
+        if refs:
+            tab, plot_id = refs[0]
+            self.tabs.setCurrentWidget(tab)
+            tab.scroll_to_plot(plot_id)
             return
-        tab, plot_id = refs[0]
-        self.tabs.setCurrentWidget(tab)
-        tab.scroll_to_plot(plot_id)
+        # VMM channels have no LiveTab/Plot of their own -- VMMTab renders them as
+        # tiles + an overlay curve instead, so channel_plots never has an entry for
+        # them. Fall back to selecting whichever VMMTab actually owns this channel.
+        for tab in self.tab_objects.values():
+            if isinstance(tab, VMMTab) and channel_id in tab.channel_ids:
+                self.tabs.setCurrentWidget(tab)
+                return
 
     def jump_to_tab(self, tab_name):
         tab = self.tab_objects.get(tab_name)
@@ -1161,24 +1168,22 @@ class VMMTab(QtWidgets.QWidget):
         self._colors = {}  # channel_id -> assigned pen color, so alarm highlighting can revert to it
         self.paused = False
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        # Overlay plot on top (gets the dominant share of the space -- it's the
+        # thing operators actually need to see) with the tile grid + Select
+        # All/None controls in a compact strip underneath, not squeezed beside it.
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
 
-        left_widget = QtWidgets.QWidget()
-        left_layout = QtWidgets.QVBoxLayout()
-        left_widget.setLayout(left_layout)
-        grid = QtWidgets.QGridLayout()
-        columns = 4
-        for i, channel_id in enumerate(self.channel_ids):
-            tile = self._build_tile(channel_id)
-            grid.addWidget(tile['frame'], i // columns, i % columns)
-            self.tiles[channel_id] = tile
-        left_layout.addLayout(grid)
-        left_layout.addStretch(1)
-        splitter.addWidget(left_widget)
+        self.overlay_widget = pg.PlotWidget(title='VMM Temperatures Overlay')
+        self.overlay_widget.setLabel('bottom', 'Time since present', units='s')
+        self.overlay_widget.setLabel('left', 'Temperature', units='degC')
+        self.overlay_widget.showGrid(x=True, y=True)
+        self.overlay_widget.addLegend()
+        splitter.addWidget(self.overlay_widget)
 
-        right_widget = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout()
-        right_widget.setLayout(right_layout)
+        bottom_widget = QtWidgets.QWidget()
+        bottom_layout = QtWidgets.QVBoxLayout()
+        bottom_layout.setContentsMargins(4, 4, 4, 4)
+        bottom_widget.setLayout(bottom_layout)
 
         controls_row = QtWidgets.QHBoxLayout()
         select_all_button = QtWidgets.QPushButton('Select All')
@@ -1188,17 +1193,24 @@ class VMMTab(QtWidgets.QWidget):
         select_none_button.clicked.connect(self.select_none)
         controls_row.addWidget(select_none_button)
         controls_row.addStretch(1)
-        right_layout.addLayout(controls_row)
+        bottom_layout.addLayout(controls_row)
 
-        self.overlay_widget = pg.PlotWidget(title='VMM Temperatures Overlay')
-        self.overlay_widget.setLabel('bottom', 'Time since present', units='s')
-        self.overlay_widget.setLabel('left', 'Temperature', units='degC')
-        self.overlay_widget.showGrid(x=True, y=True)
-        self.overlay_widget.addLegend()
-        right_layout.addWidget(self.overlay_widget)
-        splitter.addWidget(right_widget)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
+        grid = QtWidgets.QGridLayout()
+        grid.setSpacing(2)
+        columns = 4
+        for i, channel_id in enumerate(self.channel_ids):
+            tile = self._build_tile(channel_id)
+            grid.addWidget(tile['frame'], i // columns, i % columns)
+            self.tiles[channel_id] = tile
+        bottom_layout.addLayout(grid)
+
+        splitter.addWidget(bottom_widget)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        # setStretchFactor only governs resize behavior, not the initial split (which
+        # QSplitter otherwise derives from sizeHint(), letting 16 tiles' natural width
+        # dominate and squeeze the plot down to a sliver) -- pin a sane initial split.
+        splitter.setSizes([600, 200])
 
         if threshold is None:
             for channel_id in self.channel_ids:
@@ -1227,19 +1239,24 @@ class VMMTab(QtWidgets.QWidget):
 
         frame = QtWidgets.QFrame()
         frame.setFrameShape(QtWidgets.QFrame.Box)
-        vbox = QtWidgets.QVBoxLayout()
-        frame.setLayout(vbox)
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(4, 1, 4, 1)
+        row.setSpacing(4)
+        frame.setLayout(row)
 
-        top_row = QtWidgets.QHBoxLayout()
         checkbox = QtWidgets.QCheckBox()
         checkbox.setChecked(True)
         checkbox.stateChanged.connect(lambda state, cid=channel_id: self._on_checkbox_changed(cid, state))
-        top_row.addWidget(checkbox)
-        top_row.addWidget(QtWidgets.QLabel(f"VMM {channel.vmm_num} (F{fec}/H{hyb}/V{vmm})"))
-        vbox.addLayout(top_row)
+        row.addWidget(checkbox)
+
+        label = QtWidgets.QLabel(f"VMM {channel.vmm_num} (F{fec}/H{hyb}/V{vmm})")
+        label.setStyleSheet("font-size: 10px;")
+        row.addWidget(label)
 
         value_label = QtWidgets.QLabel('—')
-        vbox.addWidget(value_label)
+        value_label.setStyleSheet("font-size: 10px;")
+        row.addWidget(value_label)
+        row.addStretch(1)
 
         return {'frame': frame, 'checkbox': checkbox, 'value_label': value_label}
 
