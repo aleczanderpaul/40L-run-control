@@ -36,32 +36,40 @@ create_H2O_log_csv(vaisala_H2O_log_filepath)
 Alarm thresholds live here; see core_tools/alarms.py for what each AlarmSpec field means.'''
 plotter.add_channel(id='ov_pressure_g1', label='OV g1', long_label='Outer Vessel Gauge 1 Pressure',
                      filepath=outer_vessel_pressure_log_filepath, datatype='outer_vessel_gauge_1_pressure',
-                     units='Torr', log_interval_s=2, alarm=AlarmSpec(high=760.0, clear_high=750.0))
+                     units='Torr', log_interval_s=2, alarm=AlarmSpec(high=760.0, clear_high=750.0),
+                     overview_group='Outer Vessel')
 plotter.add_channel(id='ov_pressure_g2', label='OV g2', long_label='Outer Vessel Gauge 2 Pressure',
                      filepath=outer_vessel_pressure_log_filepath, datatype='outer_vessel_gauge_2_pressure',
-                     units='Torr', log_interval_s=2, alarm=AlarmSpec(high=760.0, clear_high=750.0))
+                     units='Torr', log_interval_s=2, alarm=AlarmSpec(high=760.0, clear_high=750.0),
+                     overview_group='Outer Vessel')
 #The gauge pressure sensor is +/-5V mapped to +/-5 Torr, so a *saturated* sensor reads exactly
 #5.00 and will not trip a strict `> 5.0` test. This limit intentionally detects impossible
 #readings (a wiring/scaling fault), not saturation -- do not change the comparison to `>=`.
 plotter.add_channel(id='gauge_pressure', label='Gauge', long_label='Gauge Pressure',
                      filepath=gauge_pressure_log_filepath, datatype='gauge_pressure',
-                     units='Torr', log_interval_s=0.5, alarm=AlarmSpec(abs_high=5.0, clear_abs_high=4.5))
+                     units='Torr', log_interval_s=0.5, alarm=AlarmSpec(abs_high=5.0, clear_abs_high=4.5),
+                     overview_group='Outer Vessel')
 plotter.add_channel(id='filter_line_flow', label='Flow', long_label='Filter Line Gas Flowrate',
                      filepath=alicat_flow_pressure_temp_log_filepath, datatype='filter_line_flowrate',
-                     units='SLM', log_interval_s=1)
+                     units='SLM', log_interval_s=1, overview_group='Filter Line')
 plotter.add_channel(id='filter_line_pressure', label='FL Press', long_label='Filter Line Pressure',
                      filepath=alicat_flow_pressure_temp_log_filepath, datatype='filter_line_pressure',
-                     units='Torr', log_interval_s=1)
+                     units='Torr', log_interval_s=1, overview_group='Filter Line')
 plotter.add_channel(id='filter_line_temperature', label='FL Temp', long_label='Filter Line Temperature',
                      filepath=alicat_flow_pressure_temp_log_filepath, datatype='filter_line_temperature',
-                     units='degC', log_interval_s=1)
+                     units='degC', log_interval_s=1, overview_group='Filter Line')
 plotter.add_channel(id='filter_line_h2o', label='H2O', long_label='Filter Line H2O Concentration',
                      filepath=vaisala_H2O_log_filepath, datatype='filter_line_H2O_concentration',
-                     units='ppm', log_interval_s=2)
+                     units='ppm', log_interval_s=2, overview_group='Filter Line')
 for i in range(num_vmms):
     plotter.add_channel(id=f'vmm_temp_{i}', label=f'VMM {i}', long_label=f'VMM {i} Temperature',
                          filepath=vmm_temperatures_log_filepath, datatype='vmm_temperature',
-                         units='degC', log_interval_s=2, alarm=AlarmSpec(high=40.0, clear_high=38.0), vmm_num=i)
+                         units='degC', log_interval_s=2, alarm=AlarmSpec(high=40.0, clear_high=38.0), vmm_num=i,
+                         overview_group='VMM Temperatures')
+
+'''OVERVIEW TAB -- built first so it lands first in tab order; reflects every
+channel registered above via each one's overview_group.'''
+plotter.build_overview_tab()
 
 '''GAS SYSTEM TAB'''
 pressure_tab = plotter.create_tab(tab_name='Gas System', plots_per_row=2)

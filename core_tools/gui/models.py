@@ -22,6 +22,7 @@ class Channel:
     log_interval_s: float
     alarm: AlarmSpec | None = None
     vmm_num: int | None = None
+    overview_group: str | None = None  # heading this channel appears under on the Overview tab; None = not shown there
 
 
 @dataclass

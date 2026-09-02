@@ -2,6 +2,7 @@ from pyqtgraph.Qt import QtWidgets, QtCore
 import pyqtgraph as pg
 import sys
 import time
+import math
 import datetime
 import pandas as pd
 import subprocess
@@ -77,6 +78,7 @@ class LivePlotter:
         self.tab_objects = {}  # tab_name -> LiveTab object
         self.channels = {}     # channel_id -> Channel, registered once, shared across all tabs
         self.channel_plots = {}  # channel_id -> [(LiveTab, plot_id), ...], for alarm-driven visuals
+        self.overview_tab = None  # set by build_overview_tab(), if the caller wants one
 
         self.settings = QtCore.QSettings('40L-TPC', 'RunControlGUI')
         self.event_log = EventLog()
@@ -145,10 +147,10 @@ class LivePlotter:
 
     # Register a data source once so it can be referenced by id from any tab's plots,
     # read for the status strip, or evaluated for alarms -- with or without a plot.
-    def add_channel(self, id, label, long_label, filepath, datatype, units, log_interval_s, alarm=None, vmm_num=None):
+    def add_channel(self, id, label, long_label, filepath, datatype, units, log_interval_s, alarm=None, vmm_num=None, overview_group=None):
         channel = Channel(
             id=id, label=label, long_label=long_label, filepath=filepath, datatype=datatype,
-            units=units, log_interval_s=log_interval_s, alarm=alarm, vmm_num=vmm_num,
+            units=units, log_interval_s=log_interval_s, alarm=alarm, vmm_num=vmm_num, overview_group=overview_group,
         )
         self.channels[id] = channel
         return channel
@@ -203,6 +205,8 @@ class LivePlotter:
         self.status_strip.refresh(now)
         self.alarm_banner.refresh(now)
         self._refresh_tab_badges()
+        if self.overview_tab is not None:
+            self.overview_tab.refresh_values(now)
 
     def _refresh_tab_badges(self):
         for tab_name, tab in self.tab_objects.items():
@@ -257,6 +261,17 @@ class LivePlotter:
     def create_tab(self, tab_name, plots_per_row):
         tab = LiveTab(plots_per_row, plotter=self)
         tab.tab_name = tab_name
+        self.tab_objects[tab_name] = tab
+        self.tabs.addTab(tab, tab_name)
+        return tab
+
+    # Dashboard tab: tiles (value + sparkline) grouped by each channel's
+    # overview_group, no live plots. Call this before any other create_tab() so it
+    # lands first in tab order, and after every add_channel() call it should reflect.
+    def build_overview_tab(self, tab_name='Overview'):
+        tab = OverviewTab(self)
+        tab.tab_name = tab_name
+        self.overview_tab = tab
         self.tab_objects[tab_name] = tab
         self.tabs.addTab(tab, tab_name)
         return tab
@@ -951,3 +966,97 @@ class EventLog(QtWidgets.QWidget):
             self._file.close()
         except OSError:
             pass
+
+
+class OverviewTab(QtWidgets.QWidget):
+    '''Dashboard: tiles grouped by each channel's overview_group, no live plots.
+    Values/coloring are driven by the same alarm-scan tick as everything else (no
+    extra read); sparklines run on their own slower timer since a 5-minute trend
+    doesn't need 1s precision and re-reading every channel's history that often
+    would only add to the read duplication commit 10 exists to fix.'''
+
+    SPARKLINE_WINDOW_S = 300
+    SPARKLINE_REFRESH_MS = 5000
+
+    def __init__(self, plotter):
+        super().__init__()
+        self.plotter = plotter
+        self.plots = {}  # always empty -- duck-types as a tab for _refresh_tab_badges()
+        self.tiles = []  # [{'channel_id', 'frame', 'value_label', 'curve'}, ...]
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QtWidgets.QWidget()
+        self.layout = QtWidgets.QVBoxLayout(container)
+        scroll.setWidget(container)
+        outer_layout = QtWidgets.QVBoxLayout()
+        outer_layout.addWidget(scroll)
+        self.setLayout(outer_layout)
+
+        self._build_groups()
+
+        self._sparkline_timer = QtCore.QTimer()
+        self._sparkline_timer.timeout.connect(self.refresh_sparklines)
+        self._sparkline_timer.start(self.SPARKLINE_REFRESH_MS)
+        self.refresh_sparklines()
+
+    def _build_groups(self):
+        groups = {}
+        for channel in self.plotter.channels.values():
+            if channel.overview_group is not None:
+                groups.setdefault(channel.overview_group, []).append(channel)
+
+        for group_name, channels in groups.items():
+            box = QtWidgets.QGroupBox(group_name)
+            grid = QtWidgets.QGridLayout()
+            box.setLayout(grid)
+            columns = 4
+            for i, channel in enumerate(channels):
+                tile = self._build_tile(channel)
+                grid.addWidget(tile['frame'], i // columns, i % columns)
+                self.tiles.append(tile)
+            self.layout.addWidget(box)
+        self.layout.addStretch(1)
+
+    def _build_tile(self, channel):
+        frame = QtWidgets.QFrame()
+        frame.setFrameShape(QtWidgets.QFrame.Box)
+        vbox = QtWidgets.QVBoxLayout()
+        frame.setLayout(vbox)
+
+        vbox.addWidget(QtWidgets.QLabel(channel.label))
+        value_label = QtWidgets.QLabel('—')
+        vbox.addWidget(value_label)
+
+        sparkline = pg.PlotWidget()
+        sparkline.setFixedSize(110, 34)
+        sparkline.hideAxis('bottom')
+        sparkline.hideAxis('left')
+        sparkline.setMouseEnabled(x=False, y=False)
+        sparkline.setMenuEnabled(False)
+        curve = sparkline.plot(pen='c')
+        vbox.addWidget(sparkline)
+
+        frame.mousePressEvent = lambda event, cid=channel.id: self.plotter.jump_to_channel(cid)
+
+        return {'channel_id': channel.id, 'frame': frame, 'value_label': value_label, 'curve': curve}
+
+    def refresh_values(self, now):
+        for tile in self.tiles:
+            channel = self.plotter.channels[tile['channel_id']]
+            state = self.plotter.alarm_evaluator.state_for(tile['channel_id'])
+            status = display_status(state)
+            text, style = format_channel_value(channel, state, status, offset=0.0, now=now)
+            tile['value_label'].setText(text)
+            tile['value_label'].setStyleSheet(style)
+            tile['frame'].setStyleSheet(f"border: 2px solid {ALARM_COLOR};" if state.state == AlarmState.ALARM else "")
+
+    def refresh_sparklines(self):
+        for tile in self.tiles:
+            channel = self.plotter.channels[tile['channel_id']]
+            n = max(2, math.ceil(self.SPARKLINE_WINDOW_S / channel.log_interval_s))
+            try:
+                x_data, y_data = get_n_XY_datapoints(channel.filepath, n, channel.datatype, channel.vmm_num)
+            except (pd.errors.ParserError, ValueError, FileNotFoundError, OSError):
+                continue
+            tile['curve'].setData(x=x_data, y=y_data)
