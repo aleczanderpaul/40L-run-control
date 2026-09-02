@@ -78,12 +78,13 @@ class LivePlotter:
         self.channels = {}     # channel_id -> Channel, registered once, shared across all tabs
         self.channel_plots = {}  # channel_id -> [(LiveTab, plot_id), ...], for alarm-driven visuals
 
+        self.settings = QtCore.QSettings('40L-TPC', 'RunControlGUI')
+        self.event_log = EventLog()
+
         # Alarm banner (hidden when nothing is active) and the status strip are
         # always visible above the tabs, regardless of which tab is selected.
         self.alarm_banner = AlarmBanner(self)
-        self.main_layout.addWidget(self.alarm_banner)
         self.status_strip = StatusStrip(self)
-        self.main_layout.addWidget(self.status_strip)
 
         # Tabs (left) and the persistent control dock (right) sit side by side and
         # also stay visible regardless of which tab is selected.
@@ -95,7 +96,26 @@ class LivePlotter:
         self.main_splitter.addWidget(self.control_dock)
         self.main_splitter.setStretchFactor(0, 4)
         self.main_splitter.setStretchFactor(1, 1)
-        self.main_layout.addWidget(self.main_splitter)
+
+        top_widget = QtWidgets.QWidget()
+        top_layout = QtWidgets.QVBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_widget.setLayout(top_layout)
+        top_layout.addWidget(self.alarm_banner)
+        top_layout.addWidget(self.status_strip)
+        top_layout.addWidget(self.main_splitter)
+
+        # The control dock and the event log pane are the two collapsible regions
+        # (drag the splitter handle to 0 to collapse); the banner/strip/tabs above
+        # them are always visible instead, same as the doc's mockup.
+        self.outer_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.outer_splitter.addWidget(top_widget)
+        self.outer_splitter.addWidget(self.event_log)
+        self.outer_splitter.setStretchFactor(0, 4)
+        self.outer_splitter.setStretchFactor(1, 1)
+        self.main_layout.addWidget(self.outer_splitter)
+
+        self._restore_layout()
 
         # Alarm evaluation is driven by one scanner timer here, independent of any
         # plot's own timer/pause state (see core_tools/alarms.py and §4.4).
@@ -107,6 +127,21 @@ class LivePlotter:
 
         # Calls the cleanup function when the application is about to quit so that all running subprocesses are terminated
         self.app.aboutToQuit.connect(self.cleanup)
+
+    def log(self, message, level='INFO'):
+        self.event_log.add_line(level, message)
+
+    def _restore_layout(self):
+        outer_sizes = self.settings.value('outer_splitter_sizes')
+        if outer_sizes:
+            self.outer_splitter.setSizes([int(s) for s in outer_sizes])
+        main_sizes = self.settings.value('main_splitter_sizes')
+        if main_sizes:
+            self.main_splitter.setSizes([int(s) for s in main_sizes])
+
+    def _save_layout(self):
+        self.settings.setValue('outer_splitter_sizes', self.outer_splitter.sizes())
+        self.settings.setValue('main_splitter_sizes', self.main_splitter.sizes())
 
     # Register a data source once so it can be referenced by id from any tab's plots,
     # read for the status strip, or evaluated for alarms -- with or without a plot.
@@ -141,7 +176,10 @@ class LivePlotter:
                     samples.append((ts, float(value)))
             samples.sort(key=lambda s: s[0])
 
-            self.alarm_evaluator.evaluate_channel(channel_id, channel.alarm, samples, now, channel.log_interval_s)
+            transitions = self.alarm_evaluator.evaluate_channel(channel_id, channel.alarm, samples, now, channel.log_interval_s)
+            for transition in transitions:
+                level = 'ALARM' if transition.to_state in (AlarmState.ALARM, AlarmState.STALE) else 'INFO'
+                self.log(transition.message, level=level)
             if newest_ts is not None:
                 self._alarm_last_ts[channel_id] = newest_ts
 
@@ -225,7 +263,9 @@ class LivePlotter:
 
     # End all running logger subprocesses
     def cleanup(self):
+        self._save_layout()
         self.control_dock.cleanup()
+        self.event_log.close_file()
 
     # Show the window and start the event loop
     def run(self):
@@ -378,7 +418,7 @@ class LiveTab(QtWidgets.QWidget):
             try:
                 x_data, y_data = get_n_XY_datapoints(channel.filepath, plot.buffer_size, channel.datatype, channel.vmm_num)
             except (pd.errors.ParserError, ValueError) as e:
-                print(f"[{plot.title}] update failed: {e}")
+                self.plotter.log(f"[{plot.title}] update failed: {e}", level='ERROR')
                 continue
 
             plot.curves[i].setData(x=x_data, y=y_data + float(offset))
@@ -484,6 +524,11 @@ class ControlDock(QtWidgets.QWidget):
     every logger's structured subprocess lifecycle (LED, port/interval dropdowns,
     start/stop, crash reporting) -- LiveTab.add_logger_control() just forwards here.'''
 
+    # stderr is read on a background thread (see _read_stderr); a signal is the only
+    # safe way to hand a line back to the GUI thread for logging/widget updates --
+    # Qt widgets must never be touched directly from a non-GUI thread.
+    stderr_line_received = QtCore.pyqtSignal(str, str)  # logger_id, line
+
     def __init__(self, plotter):
         super().__init__()
         self.plotter = plotter
@@ -495,6 +540,8 @@ class ControlDock(QtWidgets.QWidget):
         self.loggers_layout = QtWidgets.QVBoxLayout()
         self.layout.addLayout(self.loggers_layout)
         self.layout.addStretch(1)
+
+        self.stderr_line_received.connect(self._on_stderr_line)
 
         # Polls every logger's subprocess for an unexpected exit; this is deliberately
         # decoupled from any single logger's own start/stop so a crash is caught even
@@ -573,7 +620,7 @@ class ControlDock(QtWidgets.QWidget):
         new_value = logger.interval_combo.itemData(idx)
         if logger.running:
             logger.pending_interval = new_value
-            print(f"[{logger.label}] interval change to {logger.interval_combo.itemText(idx)} will apply on next start")
+            self.plotter.log(f"[{logger.label}] interval change to {logger.interval_combo.itemText(idx)} will apply on next start", level='INFO')
         else:
             logger.pending_interval = None
 
@@ -608,18 +655,27 @@ class ControlDock(QtWidgets.QWidget):
         logger.start_stop_button.setStyleSheet("background-color: red;")
         logger.error_label.hide()
         self._set_led(logger, 'running')
+        self.plotter.log(f"Started logger: {logger.label} ({port}, {interval}s)", level='INFO')
 
     def _read_stderr(self, logger):
+        # Runs on a background thread -- must not touch Qt widgets or self.plotter
+        # directly. Emitting a signal marshals the call onto the GUI thread.
         process = logger.process
         if process.stderr is None:
             return
         for line in process.stderr:
             line = line.rstrip('\n')
             if line:
-                logger.stderr_lines.append(line)
-                if len(logger.stderr_lines) > 200:
-                    logger.stderr_lines.pop(0)
-                print(f"[{logger.label} stderr] {line}")  # routed to the real event log in a later commit
+                self.stderr_line_received.emit(logger.id, line)
+
+    def _on_stderr_line(self, logger_id, line):
+        logger = self.loggers.get(logger_id)
+        if logger is None:
+            return
+        logger.stderr_lines.append(line)
+        if len(logger.stderr_lines) > 200:
+            logger.stderr_lines.pop(0)
+        self.plotter.log(f"[{logger.label}] {line}", level='ERROR')
 
     def _stop_logger(self, logger):
         logger.user_stopped = True
@@ -628,6 +684,7 @@ class ControlDock(QtWidgets.QWidget):
         logger.start_stop_button.setText(f'Start {logger.label}')
         logger.start_stop_button.setStyleSheet("background-color: green;")
         self._set_led(logger, 'stopped')
+        self.plotter.log(f"Stopped logger: {logger.label}", level='INFO')
 
     @staticmethod
     def _kill(process):
@@ -653,7 +710,7 @@ class ControlDock(QtWidgets.QWidget):
                     last_line = logger.stderr_lines[-1] if logger.stderr_lines else '(no stderr captured)'
                     logger.error_label.setText(f'exit code {exit_code}: {last_line}')
                     logger.error_label.show()
-                    print(f"Logger {logger.label} exited unexpectedly (code {exit_code}): {last_line}")  # routed to the real event log in a later commit
+                    self.plotter.log(f"Logger {logger.label} exited unexpectedly (code {exit_code}): {last_line}", level='ERROR')
 
     def cleanup(self):
         for logger in self.loggers.values():
@@ -821,9 +878,76 @@ class AlarmBanner(QtWidgets.QWidget):
 
     def _on_acknowledge(self):
         if self._current_channel_id is not None:
-            self.plotter.alarm_evaluator.acknowledge(self._current_channel_id, now=time.time())
+            for transition in self.plotter.alarm_evaluator.acknowledge(self._current_channel_id, now=time.time()):
+                self.plotter.log(transition.message, level='INFO')
             self.refresh(time.time())
 
     def _on_acknowledge_all(self):
-        self.plotter.alarm_evaluator.acknowledge_all(now=time.time())
+        for transition in self.plotter.alarm_evaluator.acknowledge_all(now=time.time()):
+            self.plotter.log(transition.message, level='INFO')
         self.refresh(time.time())
+
+
+class EventLog(QtWidgets.QWidget):
+    '''Read-only, filterable, collapsible log pane at the bottom of the window.
+    Every line is also mirrored to a timestamped file on disk (flushed on every
+    write) so the log survives a GUI crash, same as the data logs it sits next to.'''
+
+    MAX_LINES = 5000
+
+    def __init__(self):
+        super().__init__()
+        self._lines = []  # formatted strings, capped at MAX_LINES, independent of the active filter
+
+        layout = QtWidgets.QVBoxLayout()
+        self.setLayout(layout)
+
+        toolbar = QtWidgets.QHBoxLayout()
+        self.filter_box = QtWidgets.QLineEdit()
+        self.filter_box.setPlaceholderText('Filter…')
+        self.filter_box.textChanged.connect(self._render)
+        toolbar.addWidget(self.filter_box)
+        copy_button = QtWidgets.QPushButton('Copy visible to clipboard')
+        copy_button.clicked.connect(self._copy_visible)
+        toolbar.addWidget(copy_button)
+        layout.addLayout(toolbar)
+
+        self.text_edit = QtWidgets.QPlainTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setMaximumBlockCount(self.MAX_LINES)
+        layout.addWidget(self.text_edit)
+
+        filename = f"event_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self._file = open(filename, 'a', encoding='utf-8')
+
+    def add_line(self, level, message):
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S')
+        line = f"{timestamp}  {level:<5}  {message}"
+
+        self._lines.append(line)
+        if len(self._lines) > self.MAX_LINES:
+            self._lines = self._lines[-self.MAX_LINES:]
+
+        self._file.write(line + '\n')
+        self._file.flush()
+
+        if self._matches_filter(line):
+            self.text_edit.appendPlainText(line)
+
+    def _matches_filter(self, line):
+        needle = self.filter_box.text().strip().lower()
+        return not needle or needle in line.lower()
+
+    def _render(self):
+        needle = self.filter_box.text().strip().lower()
+        visible = [line for line in self._lines if not needle or needle in line.lower()]
+        self.text_edit.setPlainText('\n'.join(visible))
+
+    def _copy_visible(self):
+        QtWidgets.QApplication.clipboard().setText(self.text_edit.toPlainText())
+
+    def close_file(self):
+        try:
+            self._file.close()
+        except OSError:
+            pass
