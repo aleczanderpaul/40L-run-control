@@ -13,3 +13,6 @@ build/
 
 #Mac OS Files
 .DS_Store
+
+# Event log pane's on-disk mirror (one timestamped file per run)
+event_log_*.log

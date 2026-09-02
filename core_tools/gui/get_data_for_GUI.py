@@ -55,23 +55,37 @@ def read_last_n_rows_filtered(data_filepath, n, vmm_num, chunk_size=65536, delim
         file_size = f.tell()
 
         pos = file_size
-        chunks = []
-        matched = []
+        matched = []  # kept in chronological order by prepending each (older) chunk's finds
+        carry = b''   # partial line fragment at the front of what's been processed so far
 
         while pos > len(header) and len(matched) < n:
             read_size = min(chunk_size, pos - len(header))
             pos -= read_size
             f.seek(pos)
             chunk = f.read(read_size)
-            chunks.append(chunk)
 
-            # re-filter everything read so far each time, working from
-            # the current back-position to the end of the file
-            tail_bytes = b''.join(reversed(chunks))
-            all_lines = tail_bytes.splitlines()
+            # Only the bytes just read are new; everything after them was already
+            # filtered in a previous iteration and must not be re-scanned (that
+            # re-scan of all accumulated bytes on every iteration was the O(n^2)
+            # bug -- each byte is now split/filtered exactly once).
+            combined = chunk + carry
+            split_lines = combined.split(b'\n')
 
-            matched = []
-            for line in all_lines:
+            if pos > len(header):
+                # The first fragment may itself be an incomplete line whose true
+                # start is further back in the file (not yet read) -- hold it for
+                # the next (older) iteration instead of matching against it now.
+                carry = split_lines[0]
+                new_lines = split_lines[1:]
+            else:
+                # This chunk starts exactly at the beginning of the data -- its
+                # first fragment is a genuine complete line.
+                carry = b''
+                new_lines = split_lines
+
+            this_chunk_matches = []
+            for line in new_lines:
+                line = line.rstrip(b'\r')  # tolerate \r\n line endings from external writers
                 parts = line.split(delimiter.encode())
                 if len(parts) < 5:
                     continue
@@ -80,7 +94,11 @@ def read_last_n_rows_filtered(data_filepath, n, vmm_num, chunk_size=65536, delim
                 except ValueError:
                     continue
                 if fec * 8 + hyb * 2 + vmm == vmm_num:
-                    matched.append(line)
+                    this_chunk_matches.append(line)
+
+            # This chunk is older than everything already in matched, so its finds
+            # go at the front to keep the overall list chronological.
+            matched = this_chunk_matches + matched
 
     lines = matched[-n:] if n > 0 else []
 
@@ -100,14 +118,21 @@ def get_seconds_ago(dataframe):
     else:
         raise ValueError("DataFrame must contain either a 'Time' or 'timestamp' column")
 
-    # Get the current time as a datetime object
-    current_time = datetime.now()
+    # These timestamps are written by time.strftime(...) (see
+    # save_pressure_readings_functions.py / save_H2O_sensor_readings_functions.py),
+    # which is naive local time -- so treat them as local time explicitly (tz-aware)
+    # rather than relying on an implicit, unstated "naive means local" convention.
+    # This keeps the arithmetic unambiguous regardless of the machine's timezone
+    # (e.g. a Windows box set to Pacific/Honolulu), matching the explicitly
+    # UTC-aware handling in get_seconds_ago_1904_epoch below.
+    current_time = datetime.now().astimezone()
+    local_timestamps = dataframe['timestamp'].dt.tz_localize(current_time.tzinfo)
 
     # Calculate the time difference between current_time and each timestamp in seconds
     # The subtraction produces a timedelta object, and .dt.total_seconds() converts it to float seconds
     # The negative sign (-) in front makes the value represent "seconds ago" as a negative number,
     # meaning past times will be negative
-    dataframe['seconds_ago'] = -(current_time - dataframe['timestamp']).dt.total_seconds()
+    dataframe['seconds_ago'] = -(current_time - local_timestamps).dt.total_seconds()
 
     # Return the new 'seconds_ago' Series from the dataframe
     return dataframe['seconds_ago']
