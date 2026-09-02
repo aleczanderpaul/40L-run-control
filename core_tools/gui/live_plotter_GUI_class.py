@@ -364,9 +364,11 @@ class LiveTab(QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         self.scroll_area = scroll  # kept for scroll_to_plot()
 
-        # Container widget inside the scroll area
+        # Container widget inside the scroll area: a vertical stack of either
+        # ungrouped plots (in one flat grid) or collapsible QGroupBoxes (each with
+        # its own sub-grid), added in the order add_plot() is called (§5.3).
         container = QtWidgets.QWidget()
-        self.layout = QtWidgets.QGridLayout(container)
+        self.layout = QtWidgets.QVBoxLayout(container)
 
         scroll.setWidget(container)
 
@@ -376,7 +378,9 @@ class LiveTab(QtWidgets.QWidget):
         self.setLayout(outer_layout)
 
         self.plots_per_row = plots_per_row
-        self.plot_counts = 0
+        self._ungrouped_grid = None      # built lazily -- only if an ungrouped plot is actually added
+        self._ungrouped_count = 0
+        self._groups = {}  # group name -> {'inner': QWidget, 'grid': QGridLayout, 'count': int}
 
         self.plots = {}  # plot_id -> Plot (identity/config/runtime all in one place)
 
@@ -415,12 +419,6 @@ class LiveTab(QtWidgets.QWidget):
         # x_axis and y_axis are tuples of (label, unit); channels is a list of
         # channel ids registered via add_channel. How much history is displayed is
         # governed by the global time-window selector (§7), not a per-plot setting.
-        index = self.plot_counts
-        plots_per_row = self.plots_per_row
-        self.plot_counts += 1
-        row = index // plots_per_row
-        col = index % plots_per_row
-
         plot = Plot(
             plot_id=plot_id, title=title, channel_ids=list(channels), x_axis=x_axis, y_axis=y_axis,
             offsets=list(offsets), group=group,
@@ -477,14 +475,60 @@ class LiveTab(QtWidgets.QWidget):
 
         container.addWidget(plot_widget)
 
-        # Wrap the layout in a QWidget and add it to the grid
+        # Wrap the layout in a QWidget and place it in its group's sub-grid (or the
+        # tab's flat grid if ungrouped) -- see _grid_for_group().
         container_widget = QtWidgets.QWidget()
         container_widget.setLayout(container)
         container_widget.setMinimumSize(25 * 16, 40 * 9)
-        self.layout.addWidget(container_widget, row, col)
+        grid, index = self._grid_for_group(group)
+        row, col = index // self.plots_per_row, index % self.plots_per_row
+        grid.addWidget(container_widget, row, col)
         plot.container_widget = container_widget
 
         return plot
+
+    # Groups plots into collapsible QGroupBoxes (§5.3) stacked in the order first
+    # seen; an ungrouped plot goes into one shared flat grid instead. Returns the
+    # QGridLayout to place the next widget in, plus that grid's next free index.
+    def _grid_for_group(self, group):
+        if group is None:
+            if self._ungrouped_grid is None:
+                self._ungrouped_grid = QtWidgets.QGridLayout()
+                self.layout.addLayout(self._ungrouped_grid)
+            index = self._ungrouped_count
+            self._ungrouped_count += 1
+            return self._ungrouped_grid, index
+
+        state = self._groups.get(group)
+        if state is None:
+            box = QtWidgets.QGroupBox(group)
+            box.setCheckable(True)
+
+            settings_key = f'group_collapsed/{self.tab_name}/{group}'
+            collapsed = self.plotter.settings.value(settings_key, False, type=bool)
+            box.setChecked(not collapsed)
+
+            inner = QtWidgets.QWidget()
+            grid = QtWidgets.QGridLayout()
+            inner.setLayout(grid)
+            inner.setVisible(not collapsed)
+
+            box_layout = QtWidgets.QVBoxLayout()
+            box_layout.addWidget(inner)
+            box.setLayout(box_layout)
+
+            def on_toggled(checked, inner=inner, key=settings_key):
+                inner.setVisible(checked)
+                self.plotter.settings.setValue(key, not checked)
+            box.toggled.connect(on_toggled)
+
+            self.layout.addWidget(box)
+            state = {'grid': grid, 'count': 0}
+            self._groups[group] = state
+
+        index = state['count']
+        state['count'] += 1
+        return state['grid'], index
 
     # Scroll a specific plot into view within this tab's scroll area -- used when a
     # status-strip tile or the alarm banner's message is clicked.
