@@ -16,3 +16,6 @@ build/
 
 # Event log pane's on-disk mirror (one timestamped file per run)
 event_log_*.log
+
+# Claude Code
+.claude
