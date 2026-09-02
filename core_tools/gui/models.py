@@ -45,6 +45,15 @@ class Plot:
     elapsed_timer: object = None
     running: bool = False
     in_alarm_visual: bool = False  # tracks current border/title styling so we only touch Qt state on change
+    container_widget: object = None  # the grid cell's outer widget, for scroll-into-view on tile/banner click
+
+
+@dataclass
+class AggregateTile:
+    label: str
+    channels: list[str]
+    reduce: str  # 'max' or 'min'
+    jump_to_tab: str
 
 
 @dataclass

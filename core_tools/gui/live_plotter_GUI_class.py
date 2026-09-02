@@ -2,6 +2,7 @@ from pyqtgraph.Qt import QtWidgets, QtCore
 import pyqtgraph as pg
 import sys
 import time
+import datetime
 import pandas as pd
 import subprocess
 import threading
@@ -9,7 +10,7 @@ import platform
 import serial.tools.list_ports
 
 from .get_data_for_GUI import get_n_XY_datapoints
-from .models import Channel, Plot, LoggerControl
+from .models import Channel, Plot, LoggerControl, AggregateTile
 from core_tools.alarms import AlarmEvaluator, AlarmState, DisplayStatus, display_status
 
 '''Class to handle live plotting and add various controls/buttons in a Qt GUI application.'''
@@ -28,6 +29,38 @@ ALARM_SCAN_INTERVAL_MS = 1000
 ALARM_LOOKBACK_ROWS = 50
 
 
+def format_channel_value(channel, state, status, offset, now):
+    '''(text, stylesheet) for a channel's current value -- shared by per-plot value
+    readouts, status-strip tiles, and (later) the overview tab, so all three render
+    a channel's state identically.'''
+    value = state.last_value
+    if value is None or value != value:  # NaN-safe for any numeric type
+        return "—", "color: grey;"
+
+    displayed = value + offset
+    text = f"{displayed:.3g} {channel.units}"
+    if status == DisplayStatus.ALARM:
+        return text, f"color: {ALARM_COLOR}; font-weight: bold;"
+    if status == DisplayStatus.STALE:
+        age = (now - state.last_timestamp) if state.last_timestamp else 0
+        return f"{text} (stale {age:.0f}s)", "color: grey;"
+    if status == DisplayStatus.CLEARED:
+        return text, "color: #b8860b;"
+    return text, ""
+
+
+def limit_description(alarm):
+    if alarm is None:
+        return ""
+    if alarm.high is not None:
+        return f"limit {alarm.high}"
+    if alarm.abs_high is not None:
+        return f"limit ±{alarm.abs_high}"
+    if alarm.low is not None:
+        return f"limit {alarm.low}"
+    return ""
+
+
 class LivePlotter:
     def __init__(self, win_title):
         # Create the main Qt application
@@ -41,9 +74,19 @@ class LivePlotter:
         self.main_window.setCentralWidget(self.main_widget)
         self.main_window.setWindowTitle(win_title)
 
-        # Tabs (left) and the persistent control dock (right) sit side by side and stay
-        # visible regardless of which tab is selected -- same treatment as the status
-        # strip/banner/event log, which live in main_layout above/below this splitter.
+        self.tab_objects = {}  # tab_name -> LiveTab object
+        self.channels = {}     # channel_id -> Channel, registered once, shared across all tabs
+        self.channel_plots = {}  # channel_id -> [(LiveTab, plot_id), ...], for alarm-driven visuals
+
+        # Alarm banner (hidden when nothing is active) and the status strip are
+        # always visible above the tabs, regardless of which tab is selected.
+        self.alarm_banner = AlarmBanner(self)
+        self.main_layout.addWidget(self.alarm_banner)
+        self.status_strip = StatusStrip(self)
+        self.main_layout.addWidget(self.status_strip)
+
+        # Tabs (left) and the persistent control dock (right) sit side by side and
+        # also stay visible regardless of which tab is selected.
         self.tabs = QtWidgets.QTabWidget()
         self.control_dock = ControlDock(self)
 
@@ -53,10 +96,6 @@ class LivePlotter:
         self.main_splitter.setStretchFactor(0, 4)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_layout.addWidget(self.main_splitter)
-
-        self.tab_objects = {}  # tab_name -> LiveTab object
-        self.channels = {}     # channel_id -> Channel, registered once, shared across all tabs
-        self.channel_plots = {}  # channel_id -> [(LiveTab, plot_id), ...], for alarm-driven visuals
 
         # Alarm evaluation is driven by one scanner timer here, independent of any
         # plot's own timer/pause state (see core_tools/alarms.py and §4.4).
@@ -123,26 +162,47 @@ class LivePlotter:
                 any_alarm = any(self.alarm_evaluator.state_for(cid).state == AlarmState.ALARM for cid in plot.channel_ids)
                 self._set_plot_alarm_border(plot, any_alarm)
 
-    def _style_value_label(self, label, channel, state, status, offset, now):
-        value = state.last_value
-        if value is None or value != value:  # NaN-safe for any numeric type (NaN != NaN)
-            label.setText(f"{channel.label}: —")
-            label.setStyleSheet("color: grey;")
-            return
+        self.status_strip.refresh(now)
+        self.alarm_banner.refresh(now)
+        self._refresh_tab_badges()
 
-        displayed = value + offset
-        text = f"{channel.label}: {displayed:.3g} {channel.units}"
-        if status == DisplayStatus.ALARM:
-            label.setStyleSheet(f"color: {ALARM_COLOR}; font-weight: bold;")
-        elif status == DisplayStatus.STALE:
-            age = (now - state.last_timestamp) if state.last_timestamp else 0
-            text += f" (stale {age:.0f}s)"
-            label.setStyleSheet("color: grey;")
-        elif status == DisplayStatus.CLEARED:
-            label.setStyleSheet("color: #b8860b;")
-        else:
-            label.setStyleSheet("")
-        label.setText(text)
+    def _refresh_tab_badges(self):
+        for tab_name, tab in self.tab_objects.items():
+            alarming = set()
+            for plot in tab.plots.values():
+                for channel_id in plot.channel_ids:
+                    status = display_status(self.alarm_evaluator.state_for(channel_id))
+                    if status in (DisplayStatus.ALARM, DisplayStatus.STALE):
+                        alarming.add(channel_id)
+            index = self.tabs.indexOf(tab)
+            if index < 0:
+                continue
+            self.tabs.setTabText(index, f"{tab_name} ●{len(alarming)}" if alarming else tab_name)
+
+    # Select the tab containing a channel's plot and scroll that plot into view --
+    # used by status-strip/overview tile clicks and the alarm banner's message.
+    def jump_to_channel(self, channel_id):
+        refs = self.channel_plots.get(channel_id, [])
+        if not refs:
+            return
+        tab, plot_id = refs[0]
+        self.tabs.setCurrentWidget(tab)
+        tab.scroll_to_plot(plot_id)
+
+    def jump_to_tab(self, tab_name):
+        tab = self.tab_objects.get(tab_name)
+        if tab is not None:
+            self.tabs.setCurrentWidget(tab)
+
+    # Declare which channels (plain channel ids or AggregateTile specs) appear in
+    # the always-visible status strip, and in what order.
+    def set_status_strip(self, tiles):
+        self.status_strip.set_tiles(tiles)
+
+    def _style_value_label(self, label, channel, state, status, offset, now):
+        text, style = format_channel_value(channel, state, status, offset, now)
+        label.setText(f"{channel.label}: {text}")
+        label.setStyleSheet(style)
 
     def _set_plot_alarm_border(self, plot, in_alarm):
         if in_alarm == plot.in_alarm_visual:
@@ -158,6 +218,7 @@ class LivePlotter:
     # Create a tab in the window to put plots and buttons in
     def create_tab(self, tab_name, plots_per_row):
         tab = LiveTab(plots_per_row, plotter=self)
+        tab.tab_name = tab_name
         self.tab_objects[tab_name] = tab
         self.tabs.addTab(tab, tab_name)
         return tab
@@ -177,10 +238,12 @@ class LiveTab(QtWidgets.QWidget):
         super().__init__()  # Call the constructor of the parent class (QWidget) to properly initialize the widget. This class is now a custom QTWidget
 
         self.plotter = plotter  # back-reference, needed to resolve channel ids
+        self.tab_name = None    # set by LivePlotter.create_tab() right after construction
 
         # Create a scroll area
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
+        self.scroll_area = scroll  # kept for scroll_to_plot()
 
         # Container widget inside the scroll area
         container = QtWidgets.QWidget()
@@ -294,8 +357,16 @@ class LiveTab(QtWidgets.QWidget):
         container_widget.setLayout(container)
         container_widget.setMinimumSize(25 * 16, 40 * 9)
         self.layout.addWidget(container_widget, row, col)
+        plot.container_widget = container_widget
 
         return plot
+
+    # Scroll a specific plot into view within this tab's scroll area -- used when a
+    # status-strip tile or the alarm banner's message is clicked.
+    def scroll_to_plot(self, plot_id):
+        plot = self.plots.get(plot_id)
+        if plot is not None and plot.container_widget is not None:
+            self.scroll_area.ensureWidgetVisible(plot.container_widget)
 
     # Update function: fetches data from file and updates the plot
     def update(self, plot_id):
@@ -588,3 +659,171 @@ class ControlDock(QtWidgets.QWidget):
         for logger in self.loggers.values():
             logger.user_stopped = True
             self._kill(logger.process)
+
+
+class StatusStrip(QtWidgets.QWidget):
+    '''Fixed-height row of tiles, always visible above the tabs. Declared once via
+    LivePlotter.set_status_strip([...]) with plain channel ids and/or AggregateTile
+    specs; refreshed every alarm-scan tick.'''
+
+    def __init__(self, plotter):
+        super().__init__()
+        self.plotter = plotter
+        self.tiles = []  # [(spec, value_label), ...]
+
+        self.layout = QtWidgets.QHBoxLayout()
+        self.setLayout(self.layout)
+
+    def set_tiles(self, tile_specs):
+        while self.layout.count():
+            item = self.layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.tiles = []
+
+        for spec in tile_specs:
+            frame = QtWidgets.QFrame()
+            frame.setFrameShape(QtWidgets.QFrame.Box)
+            box = QtWidgets.QVBoxLayout()
+            frame.setLayout(box)
+
+            heading = spec.label if isinstance(spec, AggregateTile) else self.plotter.channels[spec].label
+            box.addWidget(QtWidgets.QLabel(heading))
+            value_label = QtWidgets.QLabel('—')
+            box.addWidget(value_label)
+
+            frame.mousePressEvent = lambda event, s=spec: self._on_clicked(s)
+            self.layout.addWidget(frame)
+            self.tiles.append((spec, value_label))
+
+    def _on_clicked(self, spec):
+        if isinstance(spec, AggregateTile):
+            self.plotter.jump_to_tab(spec.jump_to_tab)
+        else:
+            self.plotter.jump_to_channel(spec)
+
+    def refresh(self, now):
+        for spec, value_label in self.tiles:
+            if isinstance(spec, AggregateTile):
+                self._refresh_aggregate(spec, value_label, now)
+            else:
+                self._refresh_channel(spec, value_label, now)
+
+    def _refresh_channel(self, channel_id, value_label, now):
+        channel = self.plotter.channels[channel_id]
+        state = self.plotter.alarm_evaluator.state_for(channel_id)
+        status = display_status(state)
+        text, style = format_channel_value(channel, state, status, offset=0.0, now=now)
+        value_label.setText(text)
+        value_label.setStyleSheet(style)
+
+    def _refresh_aggregate(self, spec, value_label, now):
+        worst_channel_id = None
+        worst_value = None
+        any_alarm = False
+        for channel_id in spec.channels:
+            state = self.plotter.alarm_evaluator.state_for(channel_id)
+            if display_status(state) == DisplayStatus.ALARM:
+                any_alarm = True
+            value = state.last_value
+            if value is None or value != value:
+                continue
+            if worst_value is None or (spec.reduce == 'max' and value > worst_value) or (spec.reduce == 'min' and value < worst_value):
+                worst_value = value
+                worst_channel_id = channel_id
+
+        if worst_channel_id is None:
+            value_label.setText('—')
+            value_label.setStyleSheet('color: grey;')
+            return
+
+        channel = self.plotter.channels[worst_channel_id]
+        channel_index = channel.vmm_num if channel.vmm_num is not None else worst_channel_id
+        value_label.setText(f"{worst_value:.3g} {channel.units} (ch {channel_index})")
+        value_label.setStyleSheet(f"color: {ALARM_COLOR}; font-weight: bold;" if any_alarm else "")
+
+
+class AlarmBanner(QtWidgets.QWidget):
+    '''Hidden when nothing is active. Shows the highest-priority active alarm plus a
+    count when several are active. Latched: a cleared-but-unacknowledged alarm keeps
+    the banner up (amber) until Acknowledge is clicked.'''
+
+    PRIORITY = {DisplayStatus.ALARM: 0, DisplayStatus.STALE: 1, DisplayStatus.CLEARED: 2}
+
+    def __init__(self, plotter):
+        super().__init__()
+        self.plotter = plotter
+        self._current_channel_id = None
+
+        self.layout = QtWidgets.QHBoxLayout()
+        self.setLayout(self.layout)
+
+        self.message_label = QtWidgets.QLabel('')
+        self.message_label.setStyleSheet("font-weight: bold;")
+        self.message_label.mousePressEvent = self._on_message_clicked
+        self.layout.addWidget(self.message_label, 1)
+
+        self.ack_button = QtWidgets.QPushButton('Acknowledge')
+        self.ack_button.clicked.connect(self._on_acknowledge)
+        self.layout.addWidget(self.ack_button)
+
+        self.ack_all_button = QtWidgets.QPushButton('Acknowledge All')
+        self.ack_all_button.clicked.connect(self._on_acknowledge_all)
+        self.layout.addWidget(self.ack_all_button)
+
+        self.hide()
+
+    def _active_alarms(self):
+        results = []
+        for channel_id in self.plotter.channels:
+            state = self.plotter.alarm_evaluator.state_for(channel_id)
+            status = display_status(state)
+            if status in self.PRIORITY and not state.acknowledged:
+                results.append((channel_id, status, state))
+        results.sort(key=lambda item: self.PRIORITY[item[1]])
+        return results
+
+    def refresh(self, now):
+        active = self._active_alarms()
+        if not active:
+            self._current_channel_id = None
+            self.hide()
+            return
+
+        channel_id, status, state = active[0]
+        channel = self.plotter.channels[channel_id]
+        message = self._format_message(channel, state, status, now)
+        if len(active) > 1:
+            message = f"⚠ {len(active)} alarms — {message}"
+        else:
+            message = f"⚠ {message}"
+
+        self.message_label.setText(message)
+        self._current_channel_id = channel_id
+        self.ack_all_button.setVisible(len(active) > 1)
+        self.show()
+
+    def _format_message(self, channel, state, status, now):
+        if status == DisplayStatus.ALARM:
+            limit = limit_description(channel.alarm)
+            return f"{channel.label} — {state.last_value:.3g} {channel.units} ({limit})"
+        if status == DisplayStatus.STALE:
+            age = (now - state.last_timestamp) if state.last_timestamp else 0
+            return f"{channel.label} — stale, no data for {age:.0f}s"
+        if status == DisplayStatus.CLEARED:
+            trip_str = datetime.datetime.fromtimestamp(state.trip_timestamp).strftime('%H:%M:%S') if state.trip_timestamp else '?'
+            return f"{channel.label} — cleared, peak {state.peak_value:.3g} {channel.units} at {trip_str}"
+        return channel.label
+
+    def _on_message_clicked(self, event):
+        if self._current_channel_id is not None:
+            self.plotter.jump_to_channel(self._current_channel_id)
+
+    def _on_acknowledge(self):
+        if self._current_channel_id is not None:
+            self.plotter.alarm_evaluator.acknowledge(self._current_channel_id, now=time.time())
+            self.refresh(time.time())
+
+    def _on_acknowledge_all(self):
+        self.plotter.alarm_evaluator.acknowledge_all(now=time.time())
+        self.refresh(time.time())

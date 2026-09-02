@@ -1,4 +1,5 @@
 from core_tools.gui.live_plotter_GUI_class import LivePlotter
+from core_tools.gui.models import AggregateTile
 from core_tools.MKSPDR2000_pressure.save_pressure_readings_functions import create_pressure_log_csv
 from core_tools.VaisalaDMT143_H2Osensor.save_H2O_sensor_readings_functions import create_H2O_log_csv
 from core_tools.alarms import AlarmSpec
@@ -129,5 +130,12 @@ for i in range(num_vmms):
     temp_tab.start_timer(plot_id=plot_id, interval_ms=interval_time_ms)
     vmm_plot_ids.append(plot_id)
 temp_tab.add_dropdown_menu(title='# data points shown', option_names=['10', '50', '100', '1000', '10000'], option_values=[10, 50, 100, 1000, 10000], ctrl_var=vmm_plot_ids, on_change_callback=temp_tab.change_buffer_size_multiple)
+
+'''STATUS STRIP -- always visible above the tabs, regardless of which one is selected'''
+plotter.set_status_strip([
+    'ov_pressure_g1', 'ov_pressure_g2', 'gauge_pressure',
+    'filter_line_flow', 'filter_line_pressure', 'filter_line_h2o',
+    AggregateTile(label='VMM max', channels=vmm_plot_ids, reduce='max', jump_to_tab='VMM Temperatures'),
+])
 
 plotter.run()
