@@ -1,6 +1,7 @@
 from pyqtgraph.Qt import QtWidgets, QtCore
 import pyqtgraph as pg
 import sys
+import os
 import time
 import math
 import datetime
@@ -355,7 +356,20 @@ class LivePlotter:
 
     # Show the window and start the event loop
     def run(self):
-        self.main_window.show()
+        # Plain .show() sizes the window from the widget tree's natural sizeHint,
+        # which for a QScrollArea with setWidgetResizable(True) is computed from its
+        # *content* (e.g. every Gas System plot laid out without scrolling) rather
+        # than being capped to anything -- so on first launch the window can come up
+        # larger than any actual screen, and content beyond the screen's edge is
+        # simply cut off instead of being reachable by scrolling. Size to the
+        # current screen's available geometry and start maximized instead, so the
+        # window itself can never exceed "fullscreen"; anything that still doesn't
+        # fit scrolls within its own tab/pane as designed.
+        screen = self.app.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            self.main_window.resize(available.width(), available.height())
+        self.main_window.showMaximized()
         sys.exit(self.app.exec())
 
 
@@ -486,7 +500,7 @@ class LiveTab(QtWidgets.QWidget):
         # tab's flat grid if ungrouped) -- see _grid_for_group().
         container_widget = QtWidgets.QWidget()
         container_widget.setLayout(container)
-        container_widget.setMinimumSize(25 * 16, 40 * 9)
+        container_widget.setMinimumSize(300, 220)
         grid, index = self._grid_for_group(group)
         row, col = index // self.plots_per_row, index % self.plots_per_row
         grid.addWidget(container_widget, row, col)
@@ -994,14 +1008,21 @@ class AlarmBanner(QtWidgets.QWidget):
 
 class EventLog(QtWidgets.QWidget):
     '''Read-only, filterable, collapsible log pane at the bottom of the window.
-    Every line is also mirrored to a timestamped file on disk (flushed on every
-    write) so the log survives a GUI crash, same as the data logs it sits next to.'''
+    Every line is also mirrored to a file on disk (flushed on every write) so the
+    log survives a GUI crash, same as the data logs it sits next to. Log files live
+    in LOG_DIR, one per calendar date (not one per launch) so relaunching the
+    program the same day keeps appending to that day's file; if the program is still
+    running when the date changes, the next line written rolls over to a fresh file
+    for the new day.'''
 
     MAX_LINES = 5000
+    LOG_DIR = 'event_logs'
 
     def __init__(self):
         super().__init__()
         self._lines = []  # formatted strings, capped at MAX_LINES, independent of the active filter
+        self._file = None
+        self._file_date = None
 
         layout = QtWidgets.QVBoxLayout()
         self.setLayout(layout)
@@ -1021,10 +1042,23 @@ class EventLog(QtWidgets.QWidget):
         self.text_edit.setMaximumBlockCount(self.MAX_LINES)
         layout.addWidget(self.text_edit)
 
-        filename = f"event_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        self._file = open(filename, 'a', encoding='utf-8')
+        self._open_log_file_for(datetime.date.today())
+
+    def _log_path_for(self, date):
+        os.makedirs(self.LOG_DIR, exist_ok=True)
+        return os.path.join(self.LOG_DIR, f"event_log_{date.strftime('%Y-%m-%d')}.log")
+
+    def _open_log_file_for(self, date):
+        if self._file is not None:
+            self._file.close()
+        self._file = open(self._log_path_for(date), 'a', encoding='utf-8')
+        self._file_date = date
 
     def add_line(self, level, message):
+        today = datetime.date.today()
+        if today != self._file_date:
+            self._open_log_file_for(today)
+
         timestamp = datetime.datetime.now().strftime('%H:%M:%S')
         line = f"{timestamp}  {level:<5}  {message}"
 
