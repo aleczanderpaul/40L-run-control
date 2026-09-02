@@ -73,47 +73,46 @@ plotter.build_overview_tab()
 '''GAS SYSTEM TAB'''
 pressure_tab = plotter.create_tab(tab_name='Gas System', plots_per_row=2)
 
-#gas system tab plots
+#gas system tab plots -- how much history each shows is governed by the global
+#time-window selector in the control dock (§7), not a per-plot setting
 outer_vessel_plot_title = 'Outer Vessel Pressure'
 pressure_tab.add_plot(plot_id='ov_pressure', title=outer_vessel_plot_title, channels=['ov_pressure_g1', 'ov_pressure_g2'],
                        x_axis=('Time since present', 's'), y_axis=('Pressure', 'Torr'),
                        offsets=[outer_vessel_pressure_g1_offset, outer_vessel_pressure_g2_offset],
-                       buffer_size=10, group='Outer Vessel')
+                       group='Outer Vessel')
 pressure_tab.start_timer(plot_id='ov_pressure', interval_ms=interval_time_ms)
 
 gauge_pressure_plot_title = 'Gauge Pressure'
 pressure_tab.add_plot(plot_id='gauge_pressure', title=gauge_pressure_plot_title, channels=['gauge_pressure'],
                        x_axis=('Time since present', 's'), y_axis=('Pressure', 'Torr'),
-                       offsets=[gauge_pressure_offset], buffer_size=10, group='Outer Vessel')
+                       offsets=[gauge_pressure_offset], group='Outer Vessel')
 pressure_tab.start_timer(plot_id='gauge_pressure', interval_ms=interval_time_ms)
 
 filter_line_gas_flow_plot_title = 'Filter Line Gas Flowrate'
 pressure_tab.add_plot(plot_id='filter_line_flow', title=filter_line_gas_flow_plot_title, channels=['filter_line_flow'],
                        x_axis=('Time since present', 's'), y_axis=('Flowrate', 'SLM'),
-                       offsets=[filter_line_gas_flow_offset], buffer_size=10, group='Filter Line')
+                       offsets=[filter_line_gas_flow_offset], group='Filter Line')
 pressure_tab.start_timer(plot_id='filter_line_flow', interval_ms=interval_time_ms)
 
 filter_line_pressure_plot_title = 'Filter Line Pressure'
 pressure_tab.add_plot(plot_id='filter_line_pressure', title=filter_line_pressure_plot_title, channels=['filter_line_pressure'],
                        x_axis=('Time since present', 's'), y_axis=('Pressure', 'Torr'),
-                       offsets=[filter_line_pressure_offset], buffer_size=10, group='Filter Line')
+                       offsets=[filter_line_pressure_offset], group='Filter Line')
 pressure_tab.start_timer(plot_id='filter_line_pressure', interval_ms=interval_time_ms)
 
 filter_line_temperature_plot_title = 'Filter Line Temperature'
 pressure_tab.add_plot(plot_id='filter_line_temperature', title=filter_line_temperature_plot_title, channels=['filter_line_temperature'],
                        x_axis=('Time since present', 's'), y_axis=('Temperature', 'degC'),
-                       offsets=[filter_line_temperature_offset], buffer_size=10, group='Filter Line')
+                       offsets=[filter_line_temperature_offset], group='Filter Line')
 pressure_tab.start_timer(plot_id='filter_line_temperature', interval_ms=interval_time_ms)
 
 filter_line_H2O_plot_title = 'Filter Line H2O Concentration'
 pressure_tab.add_plot(plot_id='filter_line_h2o', title=filter_line_H2O_plot_title, channels=['filter_line_h2o'],
                        x_axis=('Time since present', 's'), y_axis=('Concentration', 'ppm'),
-                       offsets=[filter_line_H2O_offset], buffer_size=10, group='Filter Line')
+                       offsets=[filter_line_H2O_offset], group='Filter Line')
 pressure_tab.start_timer(plot_id='filter_line_h2o', interval_ms=interval_time_ms)
 
 #pressure tab controls
-pressure_ctrl_plot_ids = ['ov_pressure', 'gauge_pressure', 'filter_line_flow', 'filter_line_pressure', 'filter_line_temperature', 'filter_line_h2o']
-
 log_interval_options = [('2s', 2), ('10s', 10), ('1m', 60), ('10m', 600), ('1hr', 3600)]
 pressure_tab.add_logger_control(id='log_ov_pressure', label='OV Pressure', script='log_pressure.py',
                                  log_filepath=outer_vessel_pressure_log_filepath, port='COM3',
@@ -121,8 +120,6 @@ pressure_tab.add_logger_control(id='log_ov_pressure', label='OV Pressure', scrip
 pressure_tab.add_logger_control(id='log_h2o', label='H2O Concentration', script='log_H2O_readings.py',
                                  log_filepath=vaisala_H2O_log_filepath, port='COM7',
                                  interval_options=log_interval_options, default_interval=2)
-
-pressure_tab.add_dropdown_menu(title='# data points shown', option_names=['10', '50', '100', '1000', '10000', '100000'], option_values=[10, 50, 100, 1000, 10000, 100000], ctrl_var=pressure_ctrl_plot_ids, on_change_callback=pressure_tab.change_buffer_size_multiple)
 
 '''VMM TEMPERATURES TAB -- tile grid + one overlay plot (§5.4), not 16 separate plots'''
 vmm_plot_ids = [f'vmm_temp_{i}' for i in range(num_vmms)]

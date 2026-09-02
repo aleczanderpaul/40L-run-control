@@ -12,6 +12,7 @@ import serial.tools.list_ports
 
 from .get_data_for_GUI import get_n_XY_datapoints
 from .models import Channel, Plot, LoggerControl, AggregateTile
+from .decimate import decimate_min_max
 from core_tools.alarms import AlarmEvaluator, AlarmState, DisplayStatus, display_status
 
 '''Class to handle live plotting and add various controls/buttons in a Qt GUI application.'''
@@ -28,6 +29,17 @@ ALARM_COLOR = '#e74c3c'
 # shared data cache lands, which is a known, temporary duplication of file reads.
 ALARM_SCAN_INTERVAL_MS = 1000
 ALARM_LOOKBACK_ROWS = 50
+
+# Global time-window selector (§7) -- replaces the old per-tab "# data points shown"
+# dropdowns. n = ceil(window_s / channel.log_interval_s) rows are fetched per
+# channel and decimated down to DECIMATION_CAP points if that exceeds it.
+WINDOW_OPTIONS = [('1m', 60), ('5m', 300), ('15m', 900), ('1h', 3600), ('6h', 21600), ('24h', 86400)]
+DEFAULT_WINDOW_S = 300
+DECIMATION_CAP = 20000
+
+
+def rows_for_window(window_s, log_interval_s):
+    return max(2, math.ceil(window_s / log_interval_s))
 
 
 def format_channel_value(channel, state, status, offset, now):
@@ -82,6 +94,7 @@ class LivePlotter:
 
         self.settings = QtCore.QSettings('40L-TPC', 'RunControlGUI')
         self.event_log = EventLog()
+        self.window_seconds = DEFAULT_WINDOW_S  # overwritten below once ControlDock restores any saved selection
 
         # Alarm banner (hidden when nothing is active) and the status strip are
         # always visible above the tabs, regardless of which tab is selected.
@@ -326,11 +339,6 @@ class LiveTab(QtWidgets.QWidget):
 
         self.plots = {}  # plot_id -> Plot (identity/config/runtime all in one place)
 
-        # Internal state tracking for dropdown menus
-        self.dd_menus = {}
-        self.dd_option_names = {}
-        self.dd_option_values = {}
-
     def _channel(self, channel_id):
         return self.plotter.channels[channel_id]
 
@@ -362,10 +370,10 @@ class LiveTab(QtWidgets.QWidget):
     # (kept live by the alarm scanner, so it still reflects reality while the plot
     # itself is paused) plus a small pause toggle, replacing the old full-width
     # "Stop <title>" button.
-    def add_plot(self, plot_id, title, channels, x_axis, y_axis, offsets, buffer_size=10, group=None):
-        # x_axis and y_axis are tuples of (label, unit); buffer_size is the number of
-        # data points to display at once (temporary -- superseded by the time-window
-        # selector); channels is a list of channel ids registered via add_channel.
+    def add_plot(self, plot_id, title, channels, x_axis, y_axis, offsets, group=None):
+        # x_axis and y_axis are tuples of (label, unit); channels is a list of
+        # channel ids registered via add_channel. How much history is displayed is
+        # governed by the global time-window selector (§7), not a per-plot setting.
         index = self.plot_counts
         plots_per_row = self.plots_per_row
         self.plot_counts += 1
@@ -374,7 +382,7 @@ class LiveTab(QtWidgets.QWidget):
 
         plot = Plot(
             plot_id=plot_id, title=title, channel_ids=list(channels), x_axis=x_axis, y_axis=y_axis,
-            offsets=list(offsets), group=group, buffer_size=buffer_size,
+            offsets=list(offsets), group=group,
         )
 
         container = QtWidgets.QVBoxLayout()
@@ -449,13 +457,15 @@ class LiveTab(QtWidgets.QWidget):
         for i, channel_id in enumerate(plot.channel_ids):
             channel = self._channel(channel_id)
             offset = plot.offsets[i]
+            n = rows_for_window(self.plotter.window_seconds, channel.log_interval_s)
 
             try:
-                x_data, y_data = get_n_XY_datapoints(channel.filepath, plot.buffer_size, channel.datatype, channel.vmm_num)
+                x_data, y_data = get_n_XY_datapoints(channel.filepath, n, channel.datatype, channel.vmm_num)
             except (pd.errors.ParserError, ValueError) as e:
                 self.plotter.log(f"[{plot.title}] update failed: {e}", level='ERROR')
                 continue
 
+            x_data, y_data = decimate_min_max(x_data, y_data, max_points=DECIMATION_CAP)
             plot.curves[i].setData(x=x_data, y=y_data + float(offset))
 
     # Return elapsed time in seconds since the plot started
@@ -505,55 +515,6 @@ class LiveTab(QtWidgets.QWidget):
             interval_options=interval_options, default_interval=default_interval,
         )
 
-    # Add a dropdown menu with specified options and values attached to the options
-    def add_dropdown_menu(self, title, option_names, option_values, ctrl_var=None, on_change_callback=None):
-        index = self.plot_counts
-        plots_per_row = self.plots_per_row
-        self.plot_counts += 1
-        row = index // plots_per_row
-        col = index % plots_per_row
-
-        # Vertical layout to hold the plot and button
-        container = QtWidgets.QVBoxLayout()
-
-        # Label
-        label = QtWidgets.QLabel(title)
-        container.addWidget(label)
-
-        # Dropdown (QComboBox)
-        dropdown_box = QtWidgets.QComboBox()
-        for i in range(len(option_names)):
-            dropdown_box.addItem(option_names[i], userData=option_values[i])
-        self.dd_menus[title] = dropdown_box
-        self.dd_option_names[title] = option_names
-        self.dd_option_values[title] = option_values
-
-        # If a callback function is provided, connect it
-        if on_change_callback and ctrl_var:
-            dropdown_box.currentIndexChanged.connect(
-                lambda idx, t=title, ctrl_v=ctrl_var: on_change_callback(t, ctrl_v, dropdown_box.itemText(idx), dropdown_box.itemData(idx))
-            )
-        elif on_change_callback and not ctrl_var:
-            dropdown_box.currentIndexChanged.connect(
-                lambda idx, t=title: on_change_callback(t, dropdown_box.itemText(idx), dropdown_box.itemData(idx))
-            )
-
-        # Add button to vertical container
-        container.addWidget(dropdown_box)
-
-        # Wrap the layout in a QWidget and add it to the grid
-        container_widget = QtWidgets.QWidget()
-        container_widget.setLayout(container)
-        container_widget.setMaximumWidth(500)  # prevent stretching (aesthetics)
-        self.layout.addWidget(container_widget, row, col)
-
-    # Change the buffer size of multiple plots at once, intended to be attached to a dropdown menu.
-    # ctrl_plot_ids is a list of plot_ids that correspond to the plots to change.
-    def change_buffer_size_multiple(self, title, ctrl_plot_ids, dropdown_text, new_option_value):
-        for plot_id in ctrl_plot_ids:
-            self.plots[str(plot_id)].buffer_size = new_option_value
-
-
 class ControlDock(QtWidgets.QWidget):
     '''Persistent right-hand dock, visible regardless of which tab is selected. Owns
     every logger's structured subprocess lifecycle (LED, port/interval dropdowns,
@@ -574,6 +535,37 @@ class ControlDock(QtWidgets.QWidget):
 
         self.loggers_layout = QtWidgets.QVBoxLayout()
         self.layout.addLayout(self.loggers_layout)
+
+        window_row = QtWidgets.QHBoxLayout()
+        window_row.addWidget(QtWidgets.QLabel('Window:'))
+        self.window_combo = QtWidgets.QComboBox()
+        for option_label, seconds in WINDOW_OPTIONS:
+            self.window_combo.addItem(option_label, userData=seconds)
+        default_index = self.window_combo.findData(DEFAULT_WINDOW_S)
+        self.window_combo.setCurrentIndex(default_index if default_index >= 0 else 0)
+        saved_window = self.plotter.settings.value('window_seconds')
+        if saved_window is not None:
+            saved_index = self.window_combo.findData(int(saved_window))
+            if saved_index >= 0:
+                self.window_combo.setCurrentIndex(saved_index)
+        self.plotter.window_seconds = self.window_combo.currentData()
+        self.window_combo.currentIndexChanged.connect(self._on_window_changed)
+        window_row.addWidget(self.window_combo)
+        self.layout.addLayout(window_row)
+
+        pause_row = QtWidgets.QHBoxLayout()
+        pause_all_button = QtWidgets.QPushButton('Pause All')
+        pause_all_button.clicked.connect(self._pause_all)
+        pause_row.addWidget(pause_all_button)
+        resume_all_button = QtWidgets.QPushButton('Resume All')
+        resume_all_button.clicked.connect(self._resume_all)
+        pause_row.addWidget(resume_all_button)
+        self.layout.addLayout(pause_row)
+
+        acknowledge_all_button = QtWidgets.QPushButton('Acknowledge All')
+        acknowledge_all_button.clicked.connect(self._acknowledge_all)
+        self.layout.addWidget(acknowledge_all_button)
+
         self.layout.addStretch(1)
 
         self.stderr_line_received.connect(self._on_stderr_line)
@@ -587,6 +579,36 @@ class ControlDock(QtWidgets.QWidget):
 
     def _set_led(self, logger, state):
         logger.led.setStyleSheet(f"background-color: {LED_COLORS[state]}; border-radius: 6px;")
+
+    def _on_window_changed(self, idx):
+        seconds = self.window_combo.itemData(idx)
+        self.plotter.window_seconds = seconds
+        self.plotter.settings.setValue('window_seconds', seconds)
+
+    # Pauses/resumes every plot's own curve-redraw timer across every tab -- alarm
+    # evaluation is unaffected either way (§4.4), same as pausing one plot at a time.
+    def _pause_all(self):
+        for tab in self.plotter.tab_objects.values():
+            if isinstance(tab, LiveTab):
+                for plot in tab.plots.values():
+                    if plot.running:
+                        tab.toggle_plot(plot.plot_id)
+            elif isinstance(tab, VMMTab):
+                tab.pause()
+
+    def _resume_all(self):
+        for tab in self.plotter.tab_objects.values():
+            if isinstance(tab, LiveTab):
+                for plot in tab.plots.values():
+                    if not plot.running:
+                        tab.toggle_plot(plot.plot_id)
+            elif isinstance(tab, VMMTab):
+                tab.resume()
+
+    def _acknowledge_all(self):
+        for transition in self.plotter.alarm_evaluator.acknowledge_all(now=time.time()):
+            self.plotter.log(transition.message, level='INFO')
+        self.plotter.alarm_banner.refresh(time.time())
 
     # Build one logger's group box: LED, port dropdown (from the live serial port
     # list, defaulting to the declared port), interval dropdown, start/stop button,
@@ -1088,7 +1110,6 @@ class VMMTab(QtWidgets.QWidget):
     '''Replaces the wall of 16 individual plots with a 4x4 tile grid (checkbox +
     current value + alarm color) beside one overlay plot of every checked channel.'''
 
-    BUFFER_SIZE = 300  # temporary, until the time-window selector lands
     UPDATE_INTERVAL_MS = 1000
 
     def __init__(self, plotter, channel_ids, threshold=None):
@@ -1197,6 +1218,12 @@ class VMMTab(QtWidgets.QWidget):
         for tile in self.tiles.values():
             tile['checkbox'].setChecked(False)
 
+    def pause(self):
+        self._update_timer.stop()
+
+    def resume(self):
+        self._update_timer.start(self.UPDATE_INTERVAL_MS)
+
     def alarming_channel_ids(self, evaluator):
         return {cid for cid in self.channel_ids if display_status(evaluator.state_for(cid)) in (DisplayStatus.ALARM, DisplayStatus.STALE)}
 
@@ -1224,8 +1251,10 @@ class VMMTab(QtWidgets.QWidget):
     def _update_curves(self):
         for channel_id in self.channel_ids:
             channel = self.plotter.channels[channel_id]
+            n = rows_for_window(self.plotter.window_seconds, channel.log_interval_s)
             try:
-                x_data, y_data = get_n_XY_datapoints(channel.filepath, self.BUFFER_SIZE, channel.datatype, channel.vmm_num)
+                x_data, y_data = get_n_XY_datapoints(channel.filepath, n, channel.datatype, channel.vmm_num)
             except (pd.errors.ParserError, ValueError, FileNotFoundError, OSError):
                 continue
+            x_data, y_data = decimate_min_max(x_data, y_data, max_points=DECIMATION_CAP)
             self.curves[channel_id].setData(x=x_data, y=y_data)

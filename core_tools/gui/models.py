@@ -34,7 +34,6 @@ class Plot:
     y_axis: tuple[str, str]
     offsets: list[float]
     group: str | None = None
-    buffer_size: int = 10  # TEMPORARY: superseded by the time-window selector (see §7)
 
     # Runtime state, populated by LiveTab.add_plot() and mutated as the plot runs.
     plot_widget: object = None
