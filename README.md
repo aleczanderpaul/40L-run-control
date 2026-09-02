@@ -69,7 +69,8 @@ Multi-channel plots get a real legend (colors are never encoded in the title). E
 
 - `plotter.build_overview_tab()` — call this **before** any other tab so it lands first. Dashboard of tiles (value + 5-minute sparkline) grouped by each channel's `overview_group`; no live plots. Build it after every `add_channel()` call it should reflect.
 - `plotter.create_tab(tab_name, plots_per_row)` — a regular tab; call `.add_plot(...)` on the result.
-- `plotter.build_vmm_tab(tab_name, channel_ids, threshold=None)` — the VMM Temperatures tab: a 4×4 tile grid (checkbox, current value, alarm color) beside one overlay plot of every checked channel's curve. `threshold=None` derives the single threshold line from the first channel's `AlarmSpec.high`.
+- `plotter.build_vmm_tab(tab_name, channel_ids, threshold=None)` — the VMM Temperatures tab: one overlay plot of every checked channel's curve, with a compact 4-column tile row (checkbox, current value, alarm color) underneath so the plot keeps the dominant share of the space. `threshold=None` derives the single threshold line from the first channel's `AlarmSpec.high`.
+- The Event Terminal tab is added automatically (by `plotter.run()`, after every tab above) — nothing to declare for it.
 
 ### Logger controls
 
@@ -104,11 +105,11 @@ A plain channel id becomes a tile showing its label/value/units. `AggregateTile`
 
 ### Time window and other global controls
 
-The control dock (right-hand pane) also carries: the global time-window selector (`1m`/`5m`/`15m`/`1h`/`6h`/`24h`, persisted via `QSettings`; each plot fetches `ceil(window_s / channel.log_interval_s)` rows, decimated to ~20000 points via min/max-per-bucket bucketing if that's exceeded so a spike is never hidden), Pause All / Resume All (curve redraws only — never affects alarm evaluation), and Acknowledge All.
+The control dock (right-hand pane) also carries: the global time-window selector (`1m`/`5m`/`15m`/`1h`/`6h`/`24h`, persisted via `QSettings`; each plot fetches `ceil(window_s / channel.log_interval_s)` rows, decimated to ~20000 points via min/max-per-bucket bucketing if that's exceeded so a spike is never hidden), and Pause All / Resume All (curve redraws only — never affects alarm evaluation). Acknowledging alarms is done from the alarm banner (Acknowledge / Acknowledge All).
 
-### Event log
+### Event Terminal
 
-Bottom pane, collapsible, filterable. Every alarm transition, logger start/stop/crash, captured subprocess stderr, and runtime threshold/interval change is logged there and mirrored to a timestamped `event_log_*.log` file in the working directory, so it survives a GUI crash the same way the data logs do.
+A tab of its own, added after every tab `launch_GUI.py` declares, filterable. Every alarm transition, logger start/stop/crash, captured subprocess stderr, and runtime threshold/interval change is logged there and mirrored to disk in `event_logs/`, one file per calendar date (`event_log_YYYY-MM-DD.log`) rather than one per launch, so relaunching the program the same day keeps appending to that day's file and it survives a GUI crash the same way the data logs do.
 
 ## Testing
 

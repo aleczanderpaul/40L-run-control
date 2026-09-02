@@ -119,24 +119,13 @@ class LivePlotter:
         self.main_splitter.setStretchFactor(0, 4)
         self.main_splitter.setStretchFactor(1, 1)
 
-        top_widget = QtWidgets.QWidget()
-        top_layout = QtWidgets.QVBoxLayout()
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_widget.setLayout(top_layout)
-        top_layout.addWidget(self.alarm_banner)
-        top_layout.addWidget(self.status_strip)
-        top_layout.addWidget(self.main_splitter)
-
-        # The control dock and the event log pane are the two collapsible regions
-        # (drag the splitter handle to 0 to collapse); the banner/strip/tabs above
-        # them are always visible instead, same as the doc's mockup.
-        self.outer_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.outer_splitter.setHandleWidth(SPLITTER_HANDLE_WIDTH)
-        self.outer_splitter.addWidget(top_widget)
-        self.outer_splitter.addWidget(self.event_log)
-        self.outer_splitter.setStretchFactor(0, 4)
-        self.outer_splitter.setStretchFactor(1, 1)
-        self.main_layout.addWidget(self.outer_splitter)
+        # The control dock is the one collapsible region left (drag the splitter
+        # handle to 0 to collapse); the event log used to sit in a second collapsible
+        # pane below this but now lives in its own "Event Terminal" tab instead (added
+        # in run(), so it lands after every tab launch_GUI.py creates).
+        self.main_layout.addWidget(self.alarm_banner)
+        self.main_layout.addWidget(self.status_strip)
+        self.main_layout.addWidget(self.main_splitter)
 
         self._restore_layout()
 
@@ -160,15 +149,11 @@ class LivePlotter:
         self.event_log.add_line(level, message)
 
     def _restore_layout(self):
-        outer_sizes = self.settings.value('outer_splitter_sizes')
-        if outer_sizes:
-            self.outer_splitter.setSizes([int(s) for s in outer_sizes])
         main_sizes = self.settings.value('main_splitter_sizes')
         if main_sizes:
             self.main_splitter.setSizes([int(s) for s in main_sizes])
 
     def _save_layout(self):
-        self.settings.setValue('outer_splitter_sizes', self.outer_splitter.sizes())
         self.settings.setValue('main_splitter_sizes', self.main_splitter.sizes())
 
     # Register a data source once so it can be referenced by id from any tab's plots,
@@ -362,6 +347,14 @@ class LivePlotter:
 
     # Show the window and start the event loop
     def run(self):
+        # The event log is a fixed system tab, not something launch_GUI.py declares,
+        # so it's added here (the last thing that happens before showing the window)
+        # rather than in __init__ -- that guarantees it lands after every tab
+        # launch_GUI.py created, without launch_GUI.py needing to know it exists.
+        self.tab_objects['Event Terminal'] = self.event_log
+        self.event_log.tab_name = 'Event Terminal'
+        self.tabs.addTab(self.event_log, 'Event Terminal')
+
         # Plain .show() sizes the window from the widget tree's natural sizeHint,
         # which for a QScrollArea with setWidgetResizable(True) is computed from its
         # *content* (e.g. every Gas System plot laid out without scrolling) rather
@@ -1016,13 +1009,14 @@ class AlarmBanner(QtWidgets.QWidget):
 
 
 class EventLog(QtWidgets.QWidget):
-    '''Read-only, filterable, collapsible log pane at the bottom of the window.
-    Every line is also mirrored to a file on disk (flushed on every write) so the
-    log survives a GUI crash, same as the data logs it sits next to. Log files live
-    in LOG_DIR, one per calendar date (not one per launch) so relaunching the
-    program the same day keeps appending to that day's file; if the program is still
-    running when the date changes, the next line written rolls over to a fresh file
-    for the new day.'''
+    '''Read-only, filterable log view, shown in its own "Event Terminal" tab (added
+    by LivePlotter.run() so it lands after every tab launch_GUI.py creates). Every
+    line is also mirrored to a file on disk (flushed on every write) so the log
+    survives a GUI crash, same as the data logs it sits next to. Log files live in
+    LOG_DIR, one per calendar date (not one per launch) so relaunching the program
+    the same day keeps appending to that day's file; if the program is still running
+    when the date changes, the next line written rolls over to a fresh file for the
+    new day.'''
 
     MAX_LINES = 5000
     LOG_DIR = 'event_logs'
@@ -1098,6 +1092,9 @@ class EventLog(QtWidgets.QWidget):
             self._file.close()
         except OSError:
             pass
+
+    def alarming_channel_ids(self, evaluator):
+        return set()  # the log isn't tied to specific channels, so it never gets its own badge
 
 
 class OverviewTab(QtWidgets.QWidget):
