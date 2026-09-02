@@ -13,6 +13,7 @@ import serial.tools.list_ports
 from .get_data_for_GUI import get_n_XY_datapoints
 from .models import Channel, Plot, LoggerControl, AggregateTile
 from .decimate import decimate_min_max
+from .data_cache import ScanRunnable
 from core_tools.alarms import AlarmEvaluator, AlarmState, DisplayStatus, display_status
 
 '''Class to handle live plotting and add various controls/buttons in a Qt GUI application.'''
@@ -132,13 +133,18 @@ class LivePlotter:
 
         self._restore_layout()
 
-        # Alarm evaluation is driven by one scanner timer here, independent of any
-        # plot's own timer/pause state (see core_tools/alarms.py and §4.4).
+        # One scan timer drives everything: alarm evaluation (independent of any
+        # plot's own pause state, see core_tools/alarms.py and §4.4) AND every plot's
+        # curve redraw. The actual file reads happen on a QThreadPool worker thread
+        # (core_tools/gui/data_cache.py) so the GUI thread never blocks on disk; a
+        # reentrancy flag drops a tick rather than queueing if the previous scan's
+        # background job hasn't finished yet.
         self.alarm_evaluator = AlarmEvaluator()
         self._alarm_last_ts = {}  # channel_id -> newest absolute timestamp already evaluated
-        self.alarm_scan_timer = QtCore.QTimer()
-        self.alarm_scan_timer.timeout.connect(self._scan_alarms)
-        self.alarm_scan_timer.start(ALARM_SCAN_INTERVAL_MS)
+        self._scan_in_flight = False
+        self.scan_timer = QtCore.QTimer()
+        self.scan_timer.timeout.connect(self._start_scan)
+        self.scan_timer.start(ALARM_SCAN_INTERVAL_MS)
 
         # Calls the cleanup function when the application is about to quit so that all running subprocesses are terminated
         self.app.aboutToQuit.connect(self.cleanup)
@@ -168,22 +174,42 @@ class LivePlotter:
         self.channels[id] = channel
         return channel
 
-    # Read every registered channel's recent rows, feed the newly-arrived ones (not
-    # just the newest) through the alarm evaluator, and refresh every plot's value
-    # readout/border from the result. Runs regardless of which plots are paused or
-    # which tab is selected.
-    def _scan_alarms(self):
-        now = time.time()
+    # Kick off one background read of every registered channel (one disk read per
+    # distinct file -- see data_cache.py), regardless of which plots are paused or
+    # which tab is selected. Dropped rather than queued if the previous scan's
+    # background job is still running.
+    def _start_scan(self):
+        if self._scan_in_flight:
+            return
+        self._scan_in_flight = True
+
+        requests = []
         for channel_id, channel in self.channels.items():
-            try:
-                times_ago, values = get_n_XY_datapoints(channel.filepath, ALARM_LOOKBACK_ROWS, channel.datatype, channel.vmm_num)
-            except (pd.errors.ParserError, ValueError, FileNotFoundError, OSError):
-                continue  # can't read right now (e.g. an external logger hasn't written yet) -- retry next tick
+            n = max(ALARM_LOOKBACK_ROWS, rows_for_window(self.window_seconds, channel.log_interval_s))
+            requests.append((channel_id, channel.filepath, n, channel.datatype, channel.vmm_num))
+
+        runnable = ScanRunnable(requests)
+        runnable.signals.finished.connect(self._on_scan_finished)
+        QtCore.QThreadPool.globalInstance().start(runnable)
+
+    # Runs on the GUI thread once the background read completes: feeds newly-arrived
+    # samples (not just the newest) through the alarm evaluator, and redraws every
+    # unpaused plot/VMM-overlay curve referencing each channel.
+    def _on_scan_finished(self, results):
+        self._scan_in_flight = False
+        now = time.time()
+
+        for channel_id, result in results.items():
+            channel = self.channels[channel_id]
+            if result[0] == 'error':
+                self.log(f"[{channel.label}] read failed: {result[1]}", level='ERROR')
+                continue
+            _, x_data, y_data = result
 
             last_seen = self._alarm_last_ts.get(channel_id)
             newest_ts = last_seen
             samples = []
-            for seconds_ago, value in zip(times_ago, values):
+            for seconds_ago, value in zip(x_data, y_data):
                 ts = now + float(seconds_ago)
                 if newest_ts is None or ts > newest_ts:
                     newest_ts = ts
@@ -197,6 +223,21 @@ class LivePlotter:
                 self.log(transition.message, level=level)
             if newest_ts is not None:
                 self._alarm_last_ts[channel_id] = newest_ts
+
+            # Decimate once per channel (independent of which plot/offset uses it)
+            # and reuse for every consumer of this channel's curve.
+            dec_x, dec_y = decimate_min_max(x_data, y_data, max_points=DECIMATION_CAP)
+
+            for tab, plot_id in self.channel_plots.get(channel_id, []):
+                plot = tab.plots.get(plot_id)
+                if plot is None or not plot.running:
+                    continue
+                idx = plot.channel_ids.index(channel_id)
+                plot.curves[idx].setData(x=dec_x, y=dec_y + float(plot.offsets[idx]))
+
+            for tab in self.tab_objects.values():
+                if isinstance(tab, VMMTab) and not tab.paused and channel_id in tab.curves:
+                    tab.curves[channel_id].setData(x=dec_x, y=dec_y)
 
         self._refresh_alarm_visuals(now)
 
@@ -308,7 +349,7 @@ class LivePlotter:
     # Show the window and start the event loop
     def run(self):
         self.main_window.show()
-        sys.exit(self.app.exec_())
+        sys.exit(self.app.exec())
 
 
 class LiveTab(QtWidgets.QWidget):
@@ -432,6 +473,7 @@ class LiveTab(QtWidgets.QWidget):
             self.plotter.channel_plots.setdefault(channel_id, []).append((self, plot_id))
 
         self.plots[plot_id] = plot
+        plot.running = True  # plots redraw by default; LivePlotter's scan tick drives all of them centrally
 
         container.addWidget(plot_widget)
 
@@ -451,61 +493,15 @@ class LiveTab(QtWidgets.QWidget):
         if plot is not None and plot.container_widget is not None:
             self.scroll_area.ensureWidgetVisible(plot.container_widget)
 
-    # Update function: fetches data from file and updates the plot
-    def update(self, plot_id):
-        plot = self.plots[plot_id]
-        for i, channel_id in enumerate(plot.channel_ids):
-            channel = self._channel(channel_id)
-            offset = plot.offsets[i]
-            n = rows_for_window(self.plotter.window_seconds, channel.log_interval_s)
-
-            try:
-                x_data, y_data = get_n_XY_datapoints(channel.filepath, n, channel.datatype, channel.vmm_num)
-            except (pd.errors.ParserError, ValueError) as e:
-                self.plotter.log(f"[{plot.title}] update failed: {e}", level='ERROR')
-                continue
-
-            x_data, y_data = decimate_min_max(x_data, y_data, max_points=DECIMATION_CAP)
-            plot.curves[i].setData(x=x_data, y=y_data + float(offset))
-
-    # Return elapsed time in seconds since the plot started
-    def get_elapsed_time(self, plot_id):
-        return self.plots[plot_id].elapsed_timer.elapsed() / 1000.0  # convert ms to seconds
-
-    # Starts the QTimer that drives the updates for a given plot
-    def start_timer(self, plot_id, interval_ms):
-        plot = self.plots[plot_id]
-
-        # Create a timer to update the plot regularly
-        timer = QtCore.QTimer()
-        timer.timeout.connect(lambda: self.update(plot_id))
-        timer.start(interval_ms)
-        plot.interval_timer = timer
-
-        # Start a timer to track elapsed time
-        elapsed = QtCore.QElapsedTimer()
-        elapsed.start()
-        plot.elapsed_timer = elapsed
-
-        # Mark the plot as running
-        plot.running = True
-
-    # Toggle between running and paused for a given plot. This only stops/starts the
-    # curve redraw -- the channel's alarm evaluation is driven entirely by
-    # LivePlotter's independent scanner timer and keeps running regardless (§4.4).
+    # Toggle between running and paused for a given plot. This is just a flag
+    # LivePlotter's scan tick checks before pushing new data into this plot's
+    # curve(s) -- the channel's alarm evaluation is driven entirely by the
+    # independent scan timer and keeps running regardless either way (§4.4).
     def toggle_plot(self, plot_id):
         plot = self.plots[plot_id]
-        if plot.running:
-            plot.interval_timer.stop()
-            plot.pause_button.setText("▶")
-            plot.pause_button.setToolTip(f"Resume {plot.title}")
-            plot.running = False
-        else:
-            plot.elapsed_timer.restart()
-            plot.interval_timer.start()
-            plot.pause_button.setText("⏸")
-            plot.pause_button.setToolTip(f"Pause {plot.title}")
-            plot.running = True
+        plot.running = not plot.running
+        plot.pause_button.setText("⏸" if plot.running else "▶")
+        plot.pause_button.setToolTip(f"{'Pause' if plot.running else 'Resume'} {plot.title}")
 
     # Register a logger's controls (LED, port, interval, start/stop) in the shared
     # control dock -- see ControlDock.add_logger_group for what this actually builds.
@@ -1108,9 +1104,9 @@ class OverviewTab(QtWidgets.QWidget):
 
 class VMMTab(QtWidgets.QWidget):
     '''Replaces the wall of 16 individual plots with a 4x4 tile grid (checkbox +
-    current value + alarm color) beside one overlay plot of every checked channel.'''
-
-    UPDATE_INTERVAL_MS = 1000
+    current value + alarm color) beside one overlay plot of every checked channel.
+    Curve data is pushed in centrally by LivePlotter._on_scan_finished(); this class
+    only owns the widgets, checkbox state, and tile styling.'''
 
     def __init__(self, plotter, channel_ids, threshold=None):
         super().__init__()
@@ -1119,6 +1115,7 @@ class VMMTab(QtWidgets.QWidget):
         self.tiles = {}   # channel_id -> {'frame', 'checkbox', 'value_label'}
         self.curves = {}  # channel_id -> PlotDataItem
         self._colors = {}  # channel_id -> assigned pen color, so alarm highlighting can revert to it
+        self.paused = False
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
 
@@ -1179,11 +1176,6 @@ class VMMTab(QtWidgets.QWidget):
         outer_layout.addWidget(splitter)
         self.setLayout(outer_layout)
 
-        self._update_timer = QtCore.QTimer()
-        self._update_timer.timeout.connect(self._update_curves)
-        self._update_timer.start(self.UPDATE_INTERVAL_MS)
-        self._update_curves()
-
     def _build_tile(self, channel_id):
         channel = self.plotter.channels[channel_id]
         fec, remainder = divmod(channel.vmm_num, 8)
@@ -1219,10 +1211,10 @@ class VMMTab(QtWidgets.QWidget):
             tile['checkbox'].setChecked(False)
 
     def pause(self):
-        self._update_timer.stop()
+        self.paused = True
 
     def resume(self):
-        self._update_timer.start(self.UPDATE_INTERVAL_MS)
+        self.paused = False
 
     def alarming_channel_ids(self, evaluator):
         return {cid for cid in self.channel_ids if display_status(evaluator.state_for(cid)) in (DisplayStatus.ALARM, DisplayStatus.STALE)}
@@ -1247,14 +1239,3 @@ class VMMTab(QtWidgets.QWidget):
                     tile['checkbox'].setChecked(True)  # emits stateChanged -> curve becomes visible
             else:
                 curve.setPen(pg.mkPen(self._colors[channel_id], width=1))
-
-    def _update_curves(self):
-        for channel_id in self.channel_ids:
-            channel = self.plotter.channels[channel_id]
-            n = rows_for_window(self.plotter.window_seconds, channel.log_interval_s)
-            try:
-                x_data, y_data = get_n_XY_datapoints(channel.filepath, n, channel.datatype, channel.vmm_num)
-            except (pd.errors.ParserError, ValueError, FileNotFoundError, OSError):
-                continue
-            x_data, y_data = decimate_min_max(x_data, y_data, max_points=DECIMATION_CAP)
-            self.curves[channel_id].setData(x=x_data, y=y_data)
