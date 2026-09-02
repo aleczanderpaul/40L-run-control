@@ -39,6 +39,10 @@ WINDOW_OPTIONS = [('1m', 60), ('5m', 300), ('15m', 900), ('1h', 3600), ('6h', 21
 DEFAULT_WINDOW_S = 300
 DECIMATION_CAP = 20000
 
+# Qt's default splitter handle is ~4px, which is hard to grab precisely; widen every
+# draggable splitter in the app (control dock, event log, VMM tab's tile/plot divider).
+SPLITTER_HANDLE_WIDTH = 8
+
 
 def rows_for_window(window_s, log_interval_s):
     return max(2, math.ceil(window_s / log_interval_s))
@@ -109,6 +113,7 @@ class LivePlotter:
         self.control_dock = ControlDock(self)
 
         self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.main_splitter.setHandleWidth(SPLITTER_HANDLE_WIDTH)
         self.main_splitter.addWidget(self.tabs)
         self.main_splitter.addWidget(self.control_dock)
         self.main_splitter.setStretchFactor(0, 4)
@@ -126,6 +131,7 @@ class LivePlotter:
         # (drag the splitter handle to 0 to collapse); the banner/strip/tabs above
         # them are always visible instead, same as the doc's mockup.
         self.outer_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.outer_splitter.setHandleWidth(SPLITTER_HANDLE_WIDTH)
         self.outer_splitter.addWidget(top_widget)
         self.outer_splitter.addWidget(self.event_log)
         self.outer_splitter.setStretchFactor(0, 4)
@@ -624,10 +630,6 @@ class ControlDock(QtWidgets.QWidget):
         pause_row.addWidget(resume_all_button)
         self.layout.addLayout(pause_row)
 
-        acknowledge_all_button = QtWidgets.QPushButton('Acknowledge All')
-        acknowledge_all_button.clicked.connect(self._acknowledge_all)
-        self.layout.addWidget(acknowledge_all_button)
-
         self.layout.addStretch(1)
 
         self.stderr_line_received.connect(self._on_stderr_line)
@@ -666,11 +668,6 @@ class ControlDock(QtWidgets.QWidget):
                         tab.toggle_plot(plot.plot_id)
             elif isinstance(tab, VMMTab):
                 tab.resume()
-
-    def _acknowledge_all(self):
-        for transition in self.plotter.alarm_evaluator.acknowledge_all(now=time.time()):
-            self.plotter.log(transition.message, level='INFO')
-        self.plotter.alarm_banner.refresh(time.time())
 
     # Build one logger's group box: LED, port dropdown (from the live serial port
     # list, defaulting to the declared port), interval dropdown, start/stop button,
@@ -1219,6 +1216,7 @@ class VMMTab(QtWidgets.QWidget):
         # thing operators actually need to see) with the tile grid + Select
         # All/None controls in a compact strip underneath, not squeezed beside it.
         splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        splitter.setHandleWidth(SPLITTER_HANDLE_WIDTH)
 
         self.overlay_widget = pg.PlotWidget(title='VMM Temperatures Overlay')
         self.overlay_widget.setLabel('bottom', 'Time since present', units='s')
