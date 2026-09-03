@@ -43,9 +43,46 @@ DECIMATION_CAP = 20000
 # draggable splitter in the app (control dock, event log, VMM tab's tile/plot divider).
 SPLITTER_HANDLE_WIDTH = 8
 
+# Width of a status-strip tile's value readout. The strip sits directly in
+# main_layout, sharing a fixed total height with main_splitter, so anything that
+# lets a tile's size follow its text feeds every scan tick's text change straight
+# into the window's layout: the strip's height shifts and the tabs/control dock
+# below it lose that space. Pinning the width (and eliding instead of wrapping)
+# keeps the strip's geometry constant whatever the text does, and still avoids the
+# window-width floor an unwrapped, unconstrained label would impose -- see AlarmBanner.
+STATUS_TILE_VALUE_WIDTH = 150
+
+# Set RUNCONTROL_DEBUG_LAYOUT=1 to log every always-visible region's geometry on each
+# tab change and each scan tick, for tracing a layout that shifts on its own.
+DEBUG_LAYOUT = os.environ.get('RUNCONTROL_DEBUG_LAYOUT') == '1'
+
 
 def rows_for_window(window_s, log_interval_s):
     return max(2, math.ceil(window_s / log_interval_s))
+
+
+def apply_style(widget, style):
+    '''setStyleSheet() re-polishes the widget -- re-deriving its frame width, contents
+    margins and font metrics -- even when the sheet is byte-identical to the current
+    one. Every refresh path here runs once per scan tick over every tile in the app,
+    so re-applying unconditionally means re-computing all of their geometry every
+    second. Only touch the sheet when it actually changed.'''
+    if widget.styleSheet() != style:
+        widget.setStyleSheet(style)
+
+
+def format_age(age):
+    '''A staleness duration as a short, bounded string. Stepping the unit keeps the
+    digit count small: an age rendered as raw seconds grows a character every power
+    of ten, and every consumer of this string sits in a label whose size follows its
+    text, so an unbounded string there quietly resizes the window's layout.'''
+    if age < 600:
+        return f"{age:.0f}s"
+    if age < 180 * 60:
+        return f"{age / 60:.0f}m"
+    if age < 72 * 3600:
+        return f"{age / 3600:.0f}h"
+    return f"{age / 86400:.0f}d"
 
 
 def format_channel_value(channel, state, status, offset, now):
@@ -62,15 +99,7 @@ def format_channel_value(channel, state, status, offset, now):
         return text, f"color: {ALARM_COLOR}; font-weight: bold;"
     if status == DisplayStatus.STALE:
         age = (now - state.last_timestamp) if state.last_timestamp else 0
-        if age < 600:
-            age_str = f"{age:.0f}s"
-        elif age < 180 * 60:
-            age_str = f"{age / 60:.0f}m"
-        elif age < 72 * 3600:
-            age_str = f"{age / 3600:.0f}h"
-        else:
-            age_str = f"{age / 86400:.0f}d"
-        return f"{text} (stale {age_str})", "color: grey;"
+        return f"{text} (stale {format_age(age)})", "color: grey;"
     if status == DisplayStatus.CLEARED:
         return text, "color: #b8860b;"
     return text, ""
@@ -137,6 +166,10 @@ class LivePlotter:
 
         self._restore_layout()
 
+        if DEBUG_LAYOUT:
+            self.tabs.currentChanged.connect(
+                lambda index: self._log_layout_geometry(f"tab->{self.tabs.tabText(index)}"))
+
         # One scan timer drives everything: alarm evaluation (independent of any
         # plot's own pause state, see core_tools/alarms.py and §4.4) AND every plot's
         # curve redraw. The actual file reads happen on a QThreadPool worker thread
@@ -155,6 +188,28 @@ class LivePlotter:
 
     def log(self, message, level='INFO'):
         self.event_log.add_line(level, message)
+
+    # Diagnostic for a layout that shifts without anyone dragging anything: dumps the
+    # geometry of every always-visible region plus the VMM tab's two panes, so the
+    # widget that actually moved can be identified instead of inferred. Enabled with
+    # RUNCONTROL_DEBUG_LAYOUT=1; goes to stdout so it survives independently of the
+    # event log's own pane.
+    def _log_layout_geometry(self, reason):
+        parts = [
+            f"banner_h={self.alarm_banner.height()}",
+            f"strip_h={self.status_strip.height()}(hint={self.status_strip.sizeHint().height()},min={self.status_strip.minimumSizeHint().height()})",
+            f"splitter_h={self.main_splitter.height()}",
+            f"main_sizes={self.main_splitter.sizes()}",
+            f"tabs={self.tabs.width()}x{self.tabs.height()}",
+            f"tabbar_w={self.tabs.tabBar().sizeHint().width()}",
+            f"dock_w={self.control_dock.width()}",
+        ]
+        for tab in self.tab_objects.values():
+            if isinstance(tab, VMMTab):
+                parts.append(f"vmm_plot_h={tab.overlay_widget.height()}")
+                parts.append(f"vmm_tiles_h={tab.bottom_scroll.height()}")
+                parts.append(f"vmm_sizes={tab.splitter.sizes()}")
+        print(f"[layout/{reason}] " + " ".join(parts), flush=True)
 
     def _restore_layout(self):
         main_sizes = self.settings.value('main_splitter_sizes')
@@ -267,13 +322,21 @@ class LivePlotter:
             if isinstance(tab, VMMTab):
                 tab.refresh(now)
 
+        if DEBUG_LAYOUT:
+            self._log_layout_geometry('tick')
+
     def _refresh_tab_badges(self):
         for tab_name, tab in self.tab_objects.items():
             alarming = tab.alarming_channel_ids(self.alarm_evaluator)
             index = self.tabs.indexOf(tab)
             if index < 0:
                 continue
-            self.tabs.setTabText(index, f"{tab_name} ●{len(alarming)}" if alarming else tab_name)
+            # Zero-padded count, and only ever re-set when the text actually changes:
+            # the badge grows as channels go stale, and every setTabText re-derives
+            # the tab bar's width, which propagates into the whole window's layout.
+            text = f"{tab_name} ●{len(alarming):02d}" if alarming else tab_name
+            if self.tabs.tabText(index) != text:
+                self.tabs.setTabText(index, text)
 
     # Select the tab containing a channel's plot and scroll that plot into view --
     # used by status-strip/overview tile clicks and the alarm banner's message.
@@ -305,7 +368,7 @@ class LivePlotter:
     def _style_value_label(self, label, channel, state, status, offset, now):
         text, style = format_channel_value(channel, state, status, offset, now)
         label.setText(f"{channel.label}: {text}")
-        label.setStyleSheet(style)
+        apply_style(label, style)
 
     def _set_plot_alarm_border(self, plot, in_alarm):
         if in_alarm == plot.in_alarm_visual:
@@ -864,15 +927,20 @@ class StatusStrip(QtWidgets.QWidget):
             heading = spec.label if isinstance(spec, AggregateTile) else self.plotter.channels[spec].label
             box.addWidget(QtWidgets.QLabel(heading))
             value_label = QtWidgets.QLabel('—')
-            # This tile sits directly in main_layout (no scroll area above it), so an
-            # unwrapped label's full-text-width minimumSizeHint would otherwise
-            # become a hard floor under the whole window -- see AlarmBanner.
-            value_label.setWordWrap(True)
+            # Fixed width, never wrapped: _set_value() elides to fit instead. A
+            # word-wrapped label here re-derives its height from whatever width the
+            # layout hands it, so every tick's text change could resize the strip.
+            value_label.setFixedWidth(STATUS_TILE_VALUE_WIDTH)
             box.addWidget(value_label)
 
             frame.mousePressEvent = lambda event, s=spec: self._on_clicked(s)
             self.layout.addWidget(frame)
             self.tiles.append((spec, value_label))
+
+        # Every tile is fixed-size now, so the strip's sizeHint is stable -- pin the
+        # height so no later relayout (a tab switch re-activates the whole chain) can
+        # settle on a taller strip and take that space from the tabs below.
+        self.setFixedHeight(self.sizeHint().height())
 
     def _on_clicked(self, spec):
         if isinstance(spec, AggregateTile):
@@ -887,13 +955,19 @@ class StatusStrip(QtWidgets.QWidget):
             else:
                 self._refresh_channel(spec, value_label, now)
 
+    # Tiles are fixed-width, so long text is elided rather than allowed to resize the
+    # strip; the untruncated reading stays available as a tooltip.
+    def _set_value(self, value_label, text, style):
+        apply_style(value_label, style)
+        value_label.setText(value_label.fontMetrics().elidedText(text, QtCore.Qt.ElideRight, STATUS_TILE_VALUE_WIDTH))
+        value_label.setToolTip(text)
+
     def _refresh_channel(self, channel_id, value_label, now):
         channel = self.plotter.channels[channel_id]
         state = self.plotter.alarm_evaluator.state_for(channel_id)
         status = display_status(state)
         text, style = format_channel_value(channel, state, status, offset=0.0, now=now)
-        value_label.setText(text)
-        value_label.setStyleSheet(style)
+        self._set_value(value_label, text, style)
 
     def _refresh_aggregate(self, spec, value_label, now):
         worst_channel_id = None
@@ -911,14 +985,16 @@ class StatusStrip(QtWidgets.QWidget):
                 worst_channel_id = channel_id
 
         if worst_channel_id is None:
-            value_label.setText('—')
-            value_label.setStyleSheet('color: grey;')
+            self._set_value(value_label, '—', 'color: grey;')
             return
 
         channel = self.plotter.channels[worst_channel_id]
         channel_index = channel.vmm_num if channel.vmm_num is not None else worst_channel_id
-        value_label.setText(f"{worst_value:.3g} {channel.units} (ch {channel_index:02d})")
-        value_label.setStyleSheet(f"color: {ALARM_COLOR}; font-weight: bold;" if any_alarm else "")
+        self._set_value(
+            value_label,
+            f"{worst_value:.3g} {channel.units} (ch {channel_index:02d})",
+            f"color: {ALARM_COLOR}; font-weight: bold;" if any_alarm else "",
+        )
 
 
 class AlarmBanner(QtWidgets.QWidget):
@@ -944,7 +1020,15 @@ class AlarmBanner(QtWidgets.QWidget):
         # main_layout (not inside any scroll area) and its text length varies with
         # whatever alarm is currently active, an unwrapped long message could force
         # the whole window wider than any real screen the instant it appeared.
-        self.message_label.setWordWrap(True)
+        #
+        # Wrapping used to be the answer, but it trades a width problem for a height
+        # one: the banner then grows a line at a time as the message lengthens, and
+        # every line it gains comes out of the tabs/control dock below it. An Ignored
+        # horizontal policy drops the width floor instead, and _apply_message()
+        # elides to whatever width the banner actually has, so the message always
+        # occupies exactly one line no matter how long it gets.
+        self.message_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self._full_message = ''
         self.message_label.mousePressEvent = self._on_message_clicked
         self.layout.addWidget(self.message_label, 1)
 
@@ -956,6 +1040,18 @@ class AlarmBanner(QtWidgets.QWidget):
         self.ack_all_button.clicked.connect(self._on_acknowledge_all)
         self.layout.addWidget(self.ack_all_button)
 
+        # One row, always. The banner shares a fixed total height with main_splitter,
+        # so any height of its own that follows its contents comes straight out of the
+        # tabs/control dock below -- and its contents change every scan tick while an
+        # alarm is up. Pin the height here (as StatusStrip does) so nothing it renders
+        # can resize anything else; only appearing/disappearing moves the layout.
+        self.setFixedHeight(self.sizeHint().height())
+
+        # Ticks observed with nothing active, used to debounce hiding. A status that
+        # flickers (a value dithering across its threshold, a channel going stale and
+        # un-stale as samples trickle in) would otherwise show/hide the banner every
+        # second, and each toggle shifts everything below it by the banner's height.
+        self._empty_ticks = 0
         self.hide()
 
     def _active_alarms(self):
@@ -968,12 +1064,17 @@ class AlarmBanner(QtWidgets.QWidget):
         results.sort(key=lambda item: self.PRIORITY[item[1]])
         return results
 
+    HIDE_AFTER_EMPTY_TICKS = 3
+
     def refresh(self, now):
         active = self._active_alarms()
         if not active:
-            self._current_channel_id = None
-            self.hide()
+            self._empty_ticks += 1
+            if self._empty_ticks >= self.HIDE_AFTER_EMPTY_TICKS:
+                self._current_channel_id = None
+                self.hide()
             return
+        self._empty_ticks = 0
 
         channel_id, status, state = active[0]
         channel = self.plotter.channels[channel_id]
@@ -983,10 +1084,27 @@ class AlarmBanner(QtWidgets.QWidget):
         else:
             message = f"⚠ {message}"
 
-        self.message_label.setText(message)
+        self._full_message = message
+        self._apply_message()
         self._current_channel_id = channel_id
         self.ack_all_button.setVisible(len(active) > 1)
         self.show()
+
+    # Render the current message elided to the label's actual width, so the banner
+    # stays exactly one line tall whatever the message says. Re-run on resize, since
+    # the width to elide against is the window's.
+    def _apply_message(self):
+        width = self.message_label.width()
+        if width <= 0:
+            self.message_label.setText(self._full_message)
+            return
+        self.message_label.setText(
+            self.message_label.fontMetrics().elidedText(self._full_message, QtCore.Qt.ElideRight, width))
+        self.message_label.setToolTip(self._full_message)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_message()
 
     def _format_message(self, channel, state, status, now):
         if status == DisplayStatus.ALARM:
@@ -994,7 +1112,7 @@ class AlarmBanner(QtWidgets.QWidget):
             return f"{channel.label} — {state.last_value:.3g} {channel.units} ({limit})"
         if status == DisplayStatus.STALE:
             age = (now - state.last_timestamp) if state.last_timestamp else 0
-            return f"{channel.label} — stale, no data for {age:.0f}s"
+            return f"{channel.label} — stale, no data for {format_age(age)}"
         if status == DisplayStatus.CLEARED:
             trip_str = datetime.datetime.fromtimestamp(state.trip_timestamp).strftime('%H:%M:%S') if state.trip_timestamp else '?'
             return f"{channel.label} — cleared, peak {state.peak_value:.3g} {channel.units} at {trip_str}"
@@ -1188,8 +1306,8 @@ class OverviewTab(QtWidgets.QWidget):
             status = display_status(state)
             text, style = format_channel_value(channel, state, status, offset=0.0, now=now)
             tile['value_label'].setText(text)
-            tile['value_label'].setStyleSheet(style)
-            tile['frame'].setStyleSheet(f"border: 2px solid {ALARM_COLOR};" if state.state == AlarmState.ALARM else "")
+            apply_style(tile['value_label'], style)
+            apply_style(tile['frame'], f"border: 2px solid {ALARM_COLOR};" if state.state == AlarmState.ALARM else "")
 
     def refresh_sparklines(self):
         for tile in self.tiles:
@@ -1260,8 +1378,15 @@ class VMMTab(QtWidgets.QWidget):
         bottom_scroll = QtWidgets.QScrollArea()
         bottom_scroll.setWidgetResizable(True)
         bottom_scroll.setWidget(bottom_widget)
+        # setWidgetResizable(True) folds the content widget's minimum size into the
+        # scroll area's own, so without an explicit minimum the grid still demands
+        # room from the splitter (and the window) instead of scrolling -- which is
+        # the entire point of the scroll area. Cap it and let it scroll.
+        bottom_scroll.setMinimumSize(200, 80)
 
         splitter.addWidget(bottom_scroll)
+        self.splitter = splitter            # kept for layout diagnostics
+        self.bottom_scroll = bottom_scroll  # kept for layout diagnostics
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
         # setStretchFactor only governs resize behavior, not the initial split (which
@@ -1349,8 +1474,8 @@ class VMMTab(QtWidgets.QWidget):
 
             text, style = format_channel_value(channel, state, status, offset=0.0, now=now)
             tile['value_label'].setText(text)
-            tile['value_label'].setStyleSheet(style)
-            tile['frame'].setStyleSheet(f"border: 2px solid {ALARM_COLOR};" if state.state == AlarmState.ALARM else "")
+            apply_style(tile['value_label'], style)
+            apply_style(tile['frame'], f"border: 2px solid {ALARM_COLOR};" if state.state == AlarmState.ALARM else "")
 
             curve = self.curves[channel_id]
             if state.state == AlarmState.ALARM:
