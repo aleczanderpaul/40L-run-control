@@ -62,7 +62,15 @@ def format_channel_value(channel, state, status, offset, now):
         return text, f"color: {ALARM_COLOR}; font-weight: bold;"
     if status == DisplayStatus.STALE:
         age = (now - state.last_timestamp) if state.last_timestamp else 0
-        return f"{text} (stale {age:.0f}s)", "color: grey;"
+        if age < 600:
+            age_str = f"{age:.0f}s"
+        elif age < 180 * 60:
+            age_str = f"{age / 60:.0f}m"
+        elif age < 72 * 3600:
+            age_str = f"{age / 3600:.0f}h"
+        else:
+            age_str = f"{age / 86400:.0f}d"
+        return f"{text} (stale {age_str})", "color: grey;"
     if status == DisplayStatus.CLEARED:
         return text, "color: #b8860b;"
     return text, ""
