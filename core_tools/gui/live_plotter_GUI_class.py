@@ -52,10 +52,6 @@ SPLITTER_HANDLE_WIDTH = 8
 # window-width floor an unwrapped, unconstrained label would impose -- see AlarmBanner.
 STATUS_TILE_VALUE_WIDTH = 150
 
-# Set RUNCONTROL_DEBUG_LAYOUT=1 to log every always-visible region's geometry on each
-# tab change and each scan tick, for tracing a layout that shifts on its own.
-DEBUG_LAYOUT = os.environ.get('RUNCONTROL_DEBUG_LAYOUT') == '1'
-
 
 def rows_for_window(window_s, log_interval_s):
     return max(2, math.ceil(window_s / log_interval_s))
@@ -166,10 +162,6 @@ class LivePlotter:
 
         self._restore_layout()
 
-        if DEBUG_LAYOUT:
-            self.tabs.currentChanged.connect(
-                lambda index: self._log_layout_geometry(f"tab->{self.tabs.tabText(index)}"))
-
         # One scan timer drives everything: alarm evaluation (independent of any
         # plot's own pause state, see core_tools/alarms.py and §4.4) AND every plot's
         # curve redraw. The actual file reads happen on a QThreadPool worker thread
@@ -188,28 +180,6 @@ class LivePlotter:
 
     def log(self, message, level='INFO'):
         self.event_log.add_line(level, message)
-
-    # Diagnostic for a layout that shifts without anyone dragging anything: dumps the
-    # geometry of every always-visible region plus the VMM tab's two panes, so the
-    # widget that actually moved can be identified instead of inferred. Enabled with
-    # RUNCONTROL_DEBUG_LAYOUT=1; goes to stdout so it survives independently of the
-    # event log's own pane.
-    def _log_layout_geometry(self, reason):
-        parts = [
-            f"banner_h={self.alarm_banner.height()}",
-            f"strip_h={self.status_strip.height()}(hint={self.status_strip.sizeHint().height()},min={self.status_strip.minimumSizeHint().height()})",
-            f"splitter_h={self.main_splitter.height()}",
-            f"main_sizes={self.main_splitter.sizes()}",
-            f"tabs={self.tabs.width()}x{self.tabs.height()}",
-            f"tabbar_w={self.tabs.tabBar().sizeHint().width()}",
-            f"dock_w={self.control_dock.width()}",
-        ]
-        for tab in self.tab_objects.values():
-            if isinstance(tab, VMMTab):
-                parts.append(f"vmm_plot_h={tab.overlay_widget.height()}")
-                parts.append(f"vmm_tiles_h={tab.bottom_scroll.height()}")
-                parts.append(f"vmm_sizes={tab.splitter.sizes()}")
-        print(f"[layout/{reason}] " + " ".join(parts), flush=True)
 
     def _restore_layout(self):
         main_sizes = self.settings.value('main_splitter_sizes')
@@ -321,9 +291,6 @@ class LivePlotter:
         for tab in self.tab_objects.values():
             if isinstance(tab, VMMTab):
                 tab.refresh(now)
-
-        if DEBUG_LAYOUT:
-            self._log_layout_geometry('tick')
 
     def _refresh_tab_badges(self):
         for tab_name, tab in self.tab_objects.items():
@@ -1385,8 +1352,6 @@ class VMMTab(QtWidgets.QWidget):
         bottom_scroll.setMinimumSize(200, 80)
 
         splitter.addWidget(bottom_scroll)
-        self.splitter = splitter            # kept for layout diagnostics
-        self.bottom_scroll = bottom_scroll  # kept for layout diagnostics
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
         # setStretchFactor only governs resize behavior, not the initial split (which
