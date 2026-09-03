@@ -917,7 +917,7 @@ class StatusStrip(QtWidgets.QWidget):
 
         channel = self.plotter.channels[worst_channel_id]
         channel_index = channel.vmm_num if channel.vmm_num is not None else worst_channel_id
-        value_label.setText(f"{worst_value:.3g} {channel.units} (ch {channel_index})")
+        value_label.setText(f"{worst_value:.3g} {channel.units} (ch {channel_index:02d})")
         value_label.setStyleSheet(f"color: {ALARM_COLOR}; font-weight: bold;" if any_alarm else "")
 
 
@@ -1254,7 +1254,14 @@ class VMMTab(QtWidgets.QWidget):
             self.tiles[channel_id] = tile
         bottom_layout.addLayout(grid)
 
-        splitter.addWidget(bottom_widget)
+        # Wrapped in a scroll area (rather than added to the splitter directly) so
+        # the tile grid can grow past 16 VMMs later -- extra rows scroll instead of
+        # squeezing the overlay plot or widening the window.
+        bottom_scroll = QtWidgets.QScrollArea()
+        bottom_scroll.setWidgetResizable(True)
+        bottom_scroll.setWidget(bottom_widget)
+
+        splitter.addWidget(bottom_scroll)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
         # setStretchFactor only governs resize behavior, not the initial split (which
@@ -1296,6 +1303,7 @@ class VMMTab(QtWidgets.QWidget):
 
         checkbox = QtWidgets.QCheckBox()
         checkbox.setChecked(True)
+        checkbox.setStyleSheet("QCheckBox::indicator { width: 18px; height: 18px; }")
         checkbox.stateChanged.connect(lambda state, cid=channel_id: self._on_checkbox_changed(cid, state))
         row.addWidget(checkbox)
 
@@ -1305,7 +1313,7 @@ class VMMTab(QtWidgets.QWidget):
 
         value_label = QtWidgets.QLabel('—')
         value_label.setStyleSheet("font-size: 10px;")
-        value_label.setWordWrap(True)  # VMMTab has no scroll area, so an unwrapped label here would push the window wider -- see AlarmBanner
+        value_label.setWordWrap(True)  # keeps a stale/long reading from widening the tile grid inside the scroll area
         row.addWidget(value_label)
         row.addStretch(1)
 
