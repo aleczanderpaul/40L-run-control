@@ -917,7 +917,7 @@ class StatusStrip(QtWidgets.QWidget):
 
         channel = self.plotter.channels[worst_channel_id]
         channel_index = channel.vmm_num if channel.vmm_num is not None else worst_channel_id
-        value_label.setText(f"{worst_value:.3g} {channel.units} (ch {channel_index})")
+        value_label.setText(f"{worst_value:.3g} {channel.units} (ch {channel_index:02d})")
         value_label.setStyleSheet(f"color: {ALARM_COLOR}; font-weight: bold;" if any_alarm else "")
 
 
