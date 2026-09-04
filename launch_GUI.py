@@ -52,7 +52,7 @@ plotter.add_channel(id='ov_pressure_g2', label='OV g2', long_label='Outer Vessel
 #readings (a wiring/scaling fault), not saturation -- do not change the comparison to `>=`.
 plotter.add_channel(id='gauge_pressure', label='Gauge', long_label='Gauge Pressure',
                      filepath=gauge_pressure_log_filepath, datatype='gauge_pressure',
-                     units='Torr', log_interval_s=0.5, alarm=AlarmSpec(abs_high=5.0, clear_abs_high=4.5),
+                     units='Torr', log_interval_s=1, alarm=AlarmSpec(abs_high=5.0, clear_abs_high=4.5),
                      overview_group='Outer Vessel')
 
 plotter.add_channel(id='gas_inlet_flow', label='GI Flow', long_label='Gas Inlet Flowrate',
