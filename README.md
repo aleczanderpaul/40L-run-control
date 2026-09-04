@@ -39,7 +39,7 @@ plotter.add_channel(
 )
 ```
 
-Supported `datatype` values, and the file format each expects, are documented at the top of `core_tools/gui/get_data_for_GUI.py`.
+Supported `datatype` values are the ones dispatched on in `get_n_XY_datapoints()` in `core_tools/gui/get_data_for_GUI.py` (and mirrored in `get_n_xy_cached()` in `core_tools/gui/data_cache.py` — a new datatype must be added to **both**). The columns each one expects are visible in the `get_*` helper it calls; a datatype must only ever be paired with a `filepath` whose file actually has those columns.
 
 ### Alarms
 
@@ -95,7 +95,7 @@ Always visible above the tabs:
 ```python
 plotter.set_status_strip([
     'ov_pressure_g1', 'ov_pressure_g2', 'gauge_pressure',
-    'filter_line_flow', 'filter_line_pressure', 'filter_line_h2o',
+    'gas_inlet_flow', 'gas_inlet_flow_setpoint', 'filter_line_h2o',
     AggregateTile(label='VMM max', channels=[f'vmm_temp_{i}' for i in range(16)],
                   reduce='max', jump_to_tab='VMM Temperatures'),
 ])

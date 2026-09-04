@@ -4,8 +4,9 @@ from pyqtgraph.Qt import QtCore
 
 from .get_data_for_GUI import (
     read_last_n_rows, get_seconds_ago, get_seconds_ago_1904_epoch,
-    get_outer_vessel_gauge_pressure, get_filter_line_flowrate, get_filter_line_pressure,
-    get_filter_line_temperature, get_filter_line_H2O_concentration, get_VMM_temperature,
+    get_outer_vessel_gauge_pressure, get_alicat_flowrate, get_alicat_pressure,
+    get_alicat_temperature, get_filter_line_H2O_concentration, get_VMM_temperature,
+    get_alicat_flowrate_setpoint, get_alicat_valve_drive
 )
 
 '''One disk read per file per scan tick, fanned out to every channel that needs it --
@@ -56,14 +57,18 @@ def get_n_xy_cached(cache, filepath, n, datatype, vmm_num, read_n=None):
         return get_seconds_ago(df), get_outer_vessel_gauge_pressure(df, 1)
     elif datatype == 'outer_vessel_gauge_2_pressure':
         return get_seconds_ago(df), get_outer_vessel_gauge_pressure(df, 2)
-    elif datatype == 'filter_line_flowrate':
-        return get_seconds_ago(df), get_filter_line_flowrate(df)
-    elif datatype == 'filter_line_pressure':
-        return get_seconds_ago(df), get_filter_line_pressure(df)
-    elif datatype == 'filter_line_temperature':
-        return get_seconds_ago(df), get_filter_line_temperature(df)
+    elif datatype == 'filter_line_flowrate' or datatype == 'gas_inlet_flowrate':
+        return get_seconds_ago(df), get_alicat_flowrate(df)
+    elif datatype == 'filter_line_pressure' or datatype == 'gas_inlet_pressure':
+        return get_seconds_ago(df), get_alicat_pressure(df)
+    elif datatype == 'filter_line_temperature' or datatype == 'gas_inlet_temperature':
+        return get_seconds_ago(df), get_alicat_temperature(df)
     elif datatype == 'filter_line_H2O_concentration':
         return get_seconds_ago(df), get_filter_line_H2O_concentration(df)
+    elif datatype == 'gas_inlet_flowrate_setpoint':
+        return get_seconds_ago(df), get_alicat_flowrate_setpoint(df)
+    elif datatype == 'gas_inlet_valve_drive':
+        return get_seconds_ago(df), get_alicat_valve_drive(df)
     else:
         raise ValueError(f"Unsupported datatype: {datatype}")
 
@@ -103,7 +108,11 @@ class ScanRunnable(QtCore.QRunnable):
         for channel_id, filepath, n, datatype, vmm_num in self.requests:
             try:
                 x, y = get_n_xy_cached(cache, filepath, n, datatype, vmm_num, read_n=file_max_n[filepath])
-            except (pd.errors.ParserError, ValueError, OSError) as e:
+            # KeyError matters as much as the parse/IO errors: a datatype paired with a
+            # file that lacks its column raises it, and anything escaping run() means
+            # `finished` never fires -- LivePlotter._scan_in_flight would stay True and
+            # every channel would stop updating for the rest of the session.
+            except (pd.errors.ParserError, ValueError, KeyError, OSError) as e:
                 results[channel_id] = ('error', str(e))
                 continue
             results[channel_id] = ('ok', x, y)

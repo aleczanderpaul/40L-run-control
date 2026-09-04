@@ -1282,7 +1282,10 @@ class OverviewTab(QtWidgets.QWidget):
             n = max(2, math.ceil(self.SPARKLINE_WINDOW_S / channel.log_interval_s))
             try:
                 x_data, y_data = get_n_XY_datapoints(channel.filepath, n, channel.datatype, channel.vmm_num)
-            except (pd.errors.ParserError, ValueError, FileNotFoundError, OSError):
+            # KeyError included for the same reason as in ScanRunnable.run(): a datatype
+            # paired with a file that lacks its column raises it, and escaping this slot
+            # would skip every remaining tile's sparkline for the tick.
+            except (pd.errors.ParserError, ValueError, KeyError, FileNotFoundError, OSError):
                 continue
             tile['curve'].setData(x=x_data, y=y_data)
 

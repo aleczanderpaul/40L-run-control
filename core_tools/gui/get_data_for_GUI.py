@@ -175,17 +175,17 @@ def get_outer_vessel_gauge_pressure(dataframe, gauge_num):
     # Return the pressure values as a pandas Series with the same index as the input DataFrame
     return pd.Series(pressure, name='Pressure', index=dataframe.index)
 
-def get_filter_line_flowrate(dataframe):
+def get_alicat_flowrate(dataframe):
     flowRate = pd.to_numeric(dataframe['mass_flow_SLPM'], errors='coerce')
 
     return pd.Series(flowRate, name='Flowrate', index=dataframe.index)
 
-def get_filter_line_pressure(dataframe):
+def get_alicat_pressure(dataframe):
     pressure = pd.to_numeric(dataframe['abs_pressure_Torr'], errors='coerce')
 
     return pd.Series(pressure, name='Pressure', index=dataframe.index)
 
-def get_filter_line_temperature(dataframe):
+def get_alicat_temperature(dataframe):
     temperature = pd.to_numeric(dataframe['temperature_C'], errors='coerce')
 
     return pd.Series(temperature, name='Temperature', index=dataframe.index)
@@ -199,6 +199,16 @@ def get_VMM_temperature(dataframe):
     temperature = pd.to_numeric(dataframe['temperature'], errors='coerce')
 
     return pd.Series(temperature, name='Temperature', index=dataframe.index)
+
+def get_alicat_flowrate_setpoint(dataframe):
+    setpoint = pd.to_numeric(dataframe['mass_flow_setpoint_SLPM'], errors='coerce')
+
+    return pd.Series(setpoint, name='Mass Flow Setpoint', index=dataframe.index)
+
+def get_alicat_valve_drive(dataframe):
+    valve_drive = pd.to_numeric(dataframe['valve_drive_percentage'], errors='coerce')
+
+    return pd.Series(valve_drive, name='Valve Drive Percentage', index=dataframe.index)
 
 def get_n_XY_datapoints(data_filepath, n, datatype, vmm_num):
     if datatype == 'vmm_temperature':
@@ -222,22 +232,30 @@ def get_n_XY_datapoints(data_filepath, n, datatype, vmm_num):
         times = get_seconds_ago(dataframe)
         pressures = get_outer_vessel_gauge_pressure(dataframe, 2)
         return times, pressures
-    elif datatype == 'filter_line_flowrate':
+    elif datatype == 'filter_line_flowrate' or datatype == 'gas_inlet_flowrate':
         times = get_seconds_ago(dataframe)
-        flowrates = get_filter_line_flowrate(dataframe)
+        flowrates = get_alicat_flowrate(dataframe)
         return times, flowrates
-    elif datatype == 'filter_line_pressure':
+    elif datatype == 'filter_line_pressure' or datatype == 'gas_inlet_pressure':
         times = get_seconds_ago(dataframe)
-        pressures = get_filter_line_pressure(dataframe)
+        pressures = get_alicat_pressure(dataframe)
         return times, pressures
-    elif datatype == 'filter_line_temperature':
+    elif datatype == 'filter_line_temperature' or datatype == 'gas_inlet_temperature':
         times = get_seconds_ago(dataframe)
-        temperatures = get_filter_line_temperature(dataframe)
+        temperatures = get_alicat_temperature(dataframe)
         return times, temperatures
     elif datatype == 'filter_line_H2O_concentration':
         times = get_seconds_ago(dataframe)
         H2O_concentrations = get_filter_line_H2O_concentration(dataframe)
         return times, H2O_concentrations
+    elif datatype == 'gas_inlet_flowrate_setpoint':
+        times = get_seconds_ago(dataframe)
+        setpoints = get_alicat_flowrate_setpoint(dataframe)
+        return times, setpoints
+    elif datatype == 'gas_inlet_valve_drive':
+        times = get_seconds_ago(dataframe)
+        valve_drives = get_alicat_valve_drive(dataframe)
+        return times, valve_drives
     else:
         # Raise an error if the datatype is not supported
-        raise ValueError(f"Unsupported datatype: {datatype}. Supported types are: 'outer_vessel_gauge_1_pressure', 'outer_vessel_gauge_2_pressure', 'gauge_pressure', 'filter_line_flowrate', 'filter_line_pressure', 'filter_line_temperature', 'filter_line_H2O_concentration', 'vmm_temperature'.")
+        raise ValueError(f"Unsupported datatype: {datatype}.")
