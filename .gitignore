@@ -20,5 +20,8 @@ build/
 # Event log pane's on-disk mirror (one file per calendar date)
 event_logs/
 
+# Operator notes written at runtime (a per-run data product, like event_logs above)
+operator_notes.csv
+
 # Claude Code
 .claude

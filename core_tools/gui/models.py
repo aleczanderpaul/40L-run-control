@@ -40,6 +40,7 @@ class Plot:
     curves: list = field(default_factory=list)
     value_labels: list = field(default_factory=list)   # one per channel, in channel_ids order
     threshold_lines: list = field(default_factory=list)
+    note_lines: list = field(default_factory=list)  # reusable operator-note markers, repositioned each scan tick
     pause_button: object = None
     running: bool = False
     # Follow/frozen is independent of running (pause): a frozen plot still receives

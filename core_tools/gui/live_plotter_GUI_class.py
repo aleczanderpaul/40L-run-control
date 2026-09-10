@@ -16,6 +16,7 @@ from .models import Channel, Plot, LoggerControl, AggregateTile
 from .decimate import decimate_min_max
 from .data_cache import ScanRunnable
 from .palette import channel_palette
+from core_tools.notes import NoteStore, visible_notes
 from core_tools.alarms import AlarmEvaluator, AlarmState, DisplayStatus, display_status
 
 '''Class to handle live plotting and add various controls/buttons in a Qt GUI application.'''
@@ -161,6 +162,38 @@ def resume_following_on(plot_widget):
     plot_widget.getViewBox().enableAutoRange()
 
 
+# Operator note markers (§2). Deliberately unlike the alarm threshold lines, which
+# are dashed red: a note is not a limit and must never be mistaken for one. Vertical
+# dotted blue, and slightly wider than a hairline so there's something to hover.
+NOTE_MARKER_COLOR = '#5dade2'
+
+
+def sync_note_markers(plot_widget, pool, notes):
+    '''Point one plot's marker pool at `notes` ([(x, text), ...] from
+    core_tools.notes.visible_notes).
+
+    The pool is reused, never rebuilt: with a dozen plots refreshing once a second,
+    creating and destroying line items every tick is churn you can feel. It only ever
+    grows -- to the high-water mark of simultaneously-visible notes -- and surplus
+    lines are hidden rather than removed.
+
+    ignoreBounds=True keeps a marker out of the ViewBox's autorange calculation. A
+    marker at the edge of the window must not stretch the X range, or the act of
+    adding a note would move every following plot's view.'''
+    while len(pool) < len(notes):
+        line = pg.InfiniteLine(angle=90, movable=False,
+                               pen=pg.mkPen(NOTE_MARKER_COLOR, width=2, style=QtCore.Qt.DotLine))
+        plot_widget.addItem(line, ignoreBounds=True)
+        pool.append(line)
+
+    for line, (x, text) in zip(pool, notes):
+        line.setPos(x)
+        line.setToolTip(text)  # hovering a marker shows the note
+        line.setVisible(True)
+    for line in pool[len(notes):]:
+        line.setVisible(False)
+
+
 def limit_description(alarm):
     if alarm is None:
         return ""
@@ -193,6 +226,14 @@ class LivePlotter:
 
         self.settings = QtCore.QSettings('40L-TPC', 'RunControlGUI')
         self.event_log = EventLog()
+
+        # Operator notes (§2). Held as absolute timestamps; each plot's marker X is
+        # recomputed from them every scan tick, which is what makes markers drift
+        # left along with the data -- see _refresh_note_markers().
+        self.note_store = NoteStore()
+        self.notes = self.note_store.load_recent(now=time.time())
+        if self.notes:
+            self.log(f"Restored {len(self.notes)} operator note(s) from the last 24h", level='INFO')
         self.window_seconds = DEFAULT_WINDOW_S  # overwritten below once ControlDock restores any saved selection
 
         # Alarm banner (hidden when nothing is active) and the status strip are
@@ -250,6 +291,44 @@ class LivePlotter:
 
     def log(self, message, level='INFO'):
         self.event_log.add_line(level, message)
+
+    # One operator note: an event-log line at NOTE level (so it shows up in the Event
+    # Terminal and in that day's on-disk log alongside everything else), a row in
+    # operator_notes.csv, and a marker on every plot.
+    def add_operator_note(self, note):
+        note = note.strip()
+        if not note:
+            return None
+        now = time.time()
+
+        # Event log first: it's the record that can't fail here, so a note is never
+        # lost just because the CSV couldn't be written.
+        self.log(note, level='NOTE')
+        try:
+            self.note_store.append(note, timestamp=now)
+        except OSError as e:
+            self.log(f"could not append to {self.note_store.filepath}: {e}", level='ERROR')
+
+        self.notes.append((now, note))
+        self._refresh_note_markers(now)  # don't make the operator wait a tick to see it
+        return now
+
+    # Reposition every plot's note markers for the current `now`. Notes are stored
+    # absolute but plots use a "seconds since present" X axis, so each marker sits at
+    # note_time - now and has to be recomputed on every tick -- drawing at a fixed X
+    # would look right for exactly one tick and be silently wrong from then on.
+    # Notes are append-only at runtime, so with none recorded there is nothing drawn
+    # and nothing to hide.
+    def _refresh_note_markers(self, now):
+        if not self.notes:
+            return
+        markers = visible_notes(self.notes, now, self.window_seconds)
+        for tab in self.tab_objects.values():
+            if isinstance(tab, LiveTab):
+                for plot in tab.plots.values():
+                    sync_note_markers(plot.plot_widget, plot.note_lines, markers)
+            elif isinstance(tab, VMMTab):
+                sync_note_markers(tab.overlay_widget, tab.note_lines, markers)
 
     def _restore_layout(self):
         main_sizes = self.settings.value('main_splitter_sizes')
@@ -338,6 +417,7 @@ class LivePlotter:
                 if isinstance(tab, VMMTab) and not tab.paused and channel_id in tab.curves:
                     tab.curves[channel_id].setData(x=dec_x, y=dec_y)
 
+        self._refresh_note_markers(now)
         self._refresh_alarm_visuals(now)
 
     def _refresh_alarm_visuals(self, now):
@@ -781,6 +861,18 @@ class ControlDock(QtWidgets.QWidget):
         follow_row.addWidget(resume_following_button)
         self.layout.addLayout(follow_row)
 
+        # In the dock, not in the Event Terminal tab: the operator has to be able to
+        # jot a note without leaving whatever tab they're watching.
+        note_row = QtWidgets.QHBoxLayout()
+        note_row.addWidget(QtWidgets.QLabel('Note:'))
+        self.note_input = QtWidgets.QLineEdit()
+        self.note_input.setPlaceholderText('Type a note, press Enter')
+        self.note_input.setToolTip('Logs a NOTE line, appends to operator_notes.csv, '
+                                   'and marks every plot at this moment')
+        self.note_input.returnPressed.connect(self._on_note_entered)
+        note_row.addWidget(self.note_input)
+        self.layout.addLayout(note_row)
+
         self.layout.addStretch(1)
 
         self.stderr_line_received.connect(self._on_stderr_line)
@@ -791,6 +883,10 @@ class ControlDock(QtWidgets.QWidget):
         self._status_timer = QtCore.QTimer()
         self._status_timer.timeout.connect(self._poll_loggers)
         self._status_timer.start(500)
+
+    def _on_note_entered(self):
+        if self.plotter.add_operator_note(self.note_input.text()) is not None:
+            self.note_input.clear()  # left intact if the note was blank, so nothing is lost
 
     def _set_led(self, logger, state):
         logger.led.setStyleSheet(f"background-color: {LED_COLORS[state]}; border-radius: 6px;")
@@ -1241,7 +1337,11 @@ class EventLog(QtWidgets.QWidget):
     LOG_DIR, one per calendar date (not one per launch) so relaunching the program
     the same day keeps appending to that day's file; if the program is still running
     when the date changes, the next line written rolls over to a fresh file for the
-    new day.'''
+    new day.
+
+    Levels are free-form strings supplied by the caller (INFO, ERROR, ALARM, and NOTE
+    for operator notes) rather than an enum, so the filter box searches them as plain
+    text like everything else on the line.'''
 
     MAX_LINES = 5000
     LOG_DIR = 'event_logs'
@@ -1440,6 +1540,7 @@ class VMMTab(QtWidgets.QWidget):
         self.channel_ids = list(channel_ids)
         self.tiles = {}   # channel_id -> {'frame', 'checkbox', 'value_label', 'swatch'}
         self.curves = {}  # channel_id -> PlotDataItem
+        self.note_lines = []  # operator-note markers on the overlay, same pool as a LiveTab plot's
         # channel_id -> assigned pen color, so alarm highlighting can revert to it and
         # each tile's swatch can match its curve. Generated up front (before the tiles
         # are built) from the channel's *index*, so it's identical on every launch --
