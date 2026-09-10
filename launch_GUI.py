@@ -64,9 +64,15 @@ plotter.add_channel(id='gas_inlet_flow_setpoint', label='GI Flow SP', long_label
 plotter.add_channel(id='gas_inlet_valve_drive', label='GI Valve Drive', long_label='Gas Inlet Valve Drive',
                      filepath=alicat_gas_inlet_log_filepath, datatype='gas_inlet_valve_drive',
                      units='%', log_interval_s=2, overview_group='Gas Inlet')
+#Both Alicat absolute-pressure channels get low=0.0 with NO deadband: an absolute
+#pressure cannot be negative, so this is an impossible-value check (a broken/unscaled
+#sensor -- the filter line currently reads a steady -1110 Torr), not a limit near a
+#real operating point. clear_low therefore defaults to low, which is what we want --
+#do not "improve" this by adding a deadband.
 plotter.add_channel(id='gas_inlet_pressure', label='GI Press', long_label='Gas Inlet Pressure',
                      filepath=alicat_gas_inlet_log_filepath, datatype='gas_inlet_pressure',
-                     units='Torr', log_interval_s=2, overview_group='Gas Inlet')
+                     units='Torr', log_interval_s=2, alarm=AlarmSpec(low=0.0),
+                     overview_group='Gas Inlet')
 plotter.add_channel(id='gas_inlet_temperature', label='GI Temp', long_label='Gas Inlet Temperature',
                      filepath=alicat_gas_inlet_log_filepath, datatype='gas_inlet_temperature',
                      units='degC', log_interval_s=2, overview_group='Gas Inlet')
@@ -74,9 +80,12 @@ plotter.add_channel(id='gas_inlet_temperature', label='GI Temp', long_label='Gas
 plotter.add_channel(id='filter_line_flow', label='FL Flow', long_label='Filter Line Gas Flowrate',
                      filepath=alicat_filter_line_log_filepath, datatype='filter_line_flowrate',
                      units='SLPM', log_interval_s=2, overview_group='Filter Line')
+#Same impossible-value low limit as gas_inlet_pressure above -- no deadband, for the
+#same reason.
 plotter.add_channel(id='filter_line_pressure', label='FL Press', long_label='Filter Line Pressure',
                      filepath=alicat_filter_line_log_filepath, datatype='filter_line_pressure',
-                     units='Torr', log_interval_s=2, overview_group='Filter Line')
+                     units='Torr', log_interval_s=2, alarm=AlarmSpec(low=0.0),
+                     overview_group='Filter Line')
 plotter.add_channel(id='filter_line_temperature', label='FL Temp', long_label='Filter Line Temperature',
                      filepath=alicat_filter_line_log_filepath, datatype='filter_line_temperature',
                      units='degC', log_interval_s=2, overview_group='Filter Line')
