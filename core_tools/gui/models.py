@@ -42,6 +42,13 @@ class Plot:
     threshold_lines: list = field(default_factory=list)
     pause_button: object = None
     running: bool = False
+    # Follow/frozen is independent of running (pause): a frozen plot still receives
+    # new data, it just isn't scrolling to show it, whereas a paused plot receives
+    # none. Neither affects alarm evaluation. following flips to False the moment the
+    # user zooms or pans (ViewBox.sigRangeChangedManually) and back to True from the
+    # header indicator, Resume Following (All), or a time-window change.
+    following: bool = True
+    follow_button: object = None
     in_alarm_visual: bool = False  # tracks current border/title styling so we only touch Qt state on change
     container_widget: object = None  # the grid cell's outer widget, for scroll-into-view on tile/banner click
 

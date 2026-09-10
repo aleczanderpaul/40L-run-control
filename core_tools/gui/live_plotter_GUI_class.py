@@ -62,6 +62,11 @@ STATUS_TILE_VALUE_WIDTH = 150
 # without widening a 4-column grid of 32 tiles.
 SWATCH_SIZE = 12
 
+# Width of a plot header's follow/frozen indicator. Fixed so that flipping between
+# "FOLLOWING" and "FROZEN" can't resize the header row (and through it the plot's
+# grid cell) -- same reasoning as STATUS_TILE_VALUE_WIDTH above.
+FOLLOW_INDICATOR_WIDTH = 74
+
 
 def rows_for_window(window_s, log_interval_s):
     return max(2, math.ceil(window_s / log_interval_s))
@@ -109,6 +114,51 @@ def format_channel_value(channel, state, status, offset, now):
     if status == DisplayStatus.CLEARED:
         return text, "color: #b8860b;"
     return text, ""
+
+
+# Follow/frozen indicator (§1). A plot's ViewBox turns autorange off the moment the
+# user zooms or pans it, after which new data keeps arriving but the visible range
+# stops tracking it -- an operator can zoom in, walk away, and come back to a plot
+# that looks live while showing a frozen window into the past. FOLLOWING is
+# deliberately quiet (this is the normal state, it shouldn't compete for attention);
+# FROZEN is amber and obvious. Amber, not red: red is the alarm color everywhere else
+# in this GUI and a frozen plot is not an alarm condition.
+FROZEN_COLOR = '#f39c12'
+FOLLOW_STYLE = 'color: grey; border: none; background: transparent; font-size: 10px;'
+FROZEN_STYLE = (f'color: {FROZEN_COLOR}; border: 1px solid {FROZEN_COLOR}; '
+                'background: transparent; font-weight: bold; font-size: 10px;')
+
+
+def make_follow_indicator(on_click):
+    '''The clickable FOLLOWING/FROZEN indicator. A button rather than a label so it's
+    obviously clickable and keyboard-reachable; styled flat so FOLLOWING doesn't read
+    as a second action button sitting next to pause.'''
+    button = QtWidgets.QPushButton()
+    button.setCursor(QtCore.Qt.PointingHandCursor)
+    button.clicked.connect(lambda _: on_click())
+    set_follow_indicator(button, following=True)
+    return button
+
+
+def set_follow_indicator(button, following):
+    '''Text/style for one indicator. The text is fixed-length either way ("FOLLOWING"
+    vs "FROZEN" both render inside the same fixed width) so flipping it can never
+    resize the header row it sits in -- same constraint as the status strip's tiles.'''
+    button.setText('FOLLOWING' if following else 'FROZEN')
+    button.setToolTip(
+        'Following live data. Zoom or pan to inspect history (which freezes it).' if following
+        else 'FROZEN: still receiving data, but not scrolling to show it. Click to resume following.')
+    apply_style(button, FOLLOW_STYLE if following else FROZEN_STYLE)
+
+
+def resume_following_on(plot_widget):
+    '''Snap a plot back to live. enableAutoRange() re-derives the visible range from
+    the data's own extent, which *is* the current time window (every channel is
+    fetched for exactly that window), so this needs no explicit setXRange -- and
+    couldn't use one anyway: setXRange() turns X autorange back off, which is the very
+    state being escaped here. Y autorange is restored too, since a manual zoom
+    disabled both and leaving Y pinned to an old range still hides live data.'''
+    plot_widget.getViewBox().enableAutoRange()
 
 
 def limit_description(alarm):
@@ -515,6 +565,14 @@ class LiveTab(QtWidgets.QWidget):
             header_row.addWidget(value_label)
             plot.value_labels.append(value_label)
         header_row.addStretch(1)
+        # Follow/frozen and pause both live in this row and must not be confusable:
+        # the indicator is a word ("FOLLOWING"/"FROZEN"), the pause toggle is a glyph
+        # (⏸/▶), and they mean different things -- a frozen plot still receives data,
+        # a paused one doesn't, and neither affects alarm evaluation.
+        follow_button = make_follow_indicator(lambda p=plot_id: self.resume_following(p))
+        follow_button.setFixedWidth(FOLLOW_INDICATOR_WIDTH)
+        plot.follow_button = follow_button
+        header_row.addWidget(follow_button)
         pause_button = QtWidgets.QPushButton("⏸")
         pause_button.setFixedWidth(28)
         pause_button.setToolTip(f"Pause {title}")
@@ -529,6 +587,12 @@ class LiveTab(QtWidgets.QWidget):
         plot_widget.setLabel('left', y_axis[0], units=y_axis[1])
         plot_widget.showGrid(x=True, y=True)
         plot.plot_widget = plot_widget
+
+        # sigRangeChangedManually fires only for user zoom/pan, never for the range
+        # changes autorange itself makes as data is pushed in -- inferring "frozen"
+        # from sigRangeChanged instead would mark every plot frozen on every scan tick.
+        plot_widget.getViewBox().sigRangeChangedManually.connect(
+            lambda _mask, p=plot_id: self._on_range_changed_manually(p))
 
         # Color mapping lives in a legend, not in the plot title, whenever a plot
         # overlays more than one channel.
@@ -630,6 +694,28 @@ class LiveTab(QtWidgets.QWidget):
         plot.pause_button.setText("⏸" if plot.running else "▶")
         plot.pause_button.setToolTip(f"{'Pause' if plot.running else 'Resume'} {plot.title}")
 
+    # A user zoom/pan turned this plot's autorange off, so its visible range has
+    # stopped tracking new data. The plot keeps receiving that data (and its channels
+    # keep being evaluated for alarms) -- only the view is frozen.
+    def _on_range_changed_manually(self, plot_id):
+        plot = self.plots[plot_id]
+        if plot.following:
+            plot.following = False
+            set_follow_indicator(plot.follow_button, following=False)
+
+    # Re-enable autorange so the view snaps back to the live time window. Safe to
+    # call on a plot that's already following -- Resume Following (All) and the
+    # time-window dropdown both do exactly that.
+    def resume_following(self, plot_id):
+        plot = self.plots[plot_id]
+        resume_following_on(plot.plot_widget)
+        plot.following = True
+        set_follow_indicator(plot.follow_button, following=True)
+
+    def resume_following_all(self):
+        for plot_id in self.plots:
+            self.resume_following(plot_id)
+
     # Register a logger's controls (LED, port, interval, start/stop) in the shared
     # control dock -- see ControlDock.add_logger_group for what this actually builds.
     def add_logger_control(self, id, label, script, log_filepath, port, interval_options, default_interval):
@@ -685,6 +771,16 @@ class ControlDock(QtWidgets.QWidget):
         pause_row.addWidget(resume_all_button)
         self.layout.addLayout(pause_row)
 
+        # Separate from Pause/Resume All on purpose: pause governs whether a plot
+        # receives data at all, following governs whether its view scrolls to show
+        # the data it receives. Its own row so the two aren't read as one group.
+        follow_row = QtWidgets.QHBoxLayout()
+        resume_following_button = QtWidgets.QPushButton('Resume Following (All)')
+        resume_following_button.setToolTip('Snap every plot back to the live time window')
+        resume_following_button.clicked.connect(self.resume_following_all)
+        follow_row.addWidget(resume_following_button)
+        self.layout.addLayout(follow_row)
+
         self.layout.addStretch(1)
 
         self.stderr_line_received.connect(self._on_stderr_line)
@@ -703,6 +799,18 @@ class ControlDock(QtWidgets.QWidget):
         seconds = self.window_combo.itemData(idx)
         self.plotter.window_seconds = seconds
         self.plotter.settings.setValue('window_seconds', seconds)
+        # Asking for "1h" and having plots stay frozen at some older range would be
+        # baffling -- choosing a window is a statement about what you want to see.
+        self.resume_following_all()
+
+    # Re-enable range tracking on every plot in every tab, including the VMM overlay.
+    # Unrelated to pause: a frozen plot was already receiving data.
+    def resume_following_all(self):
+        for tab in self.plotter.tab_objects.values():
+            if isinstance(tab, LiveTab):
+                tab.resume_following_all()
+            elif isinstance(tab, VMMTab):
+                tab.resume_following()
 
     # Pauses/resumes every plot's own curve-redraw timer across every tab -- alarm
     # evaluation is unaffected either way (§4.4), same as pausing one plot at a time.
@@ -1338,6 +1446,10 @@ class VMMTab(QtWidgets.QWidget):
         # see core_tools/gui/palette.py.
         self._colors = {cid: color for cid, color in zip(self.channel_ids, channel_palette(len(self.channel_ids)))}
         self.paused = False
+        # Same follow/frozen failure mode as a LiveTab plot (§1). The overlay has no
+        # per-plot header row, so its indicator goes in the controls row below,
+        # beside Select All / Select None.
+        self.following = True
 
         # Overlay plot on top (gets the dominant share of the space -- it's the
         # thing operators actually need to see) with the tile grid + Select
@@ -1349,6 +1461,8 @@ class VMMTab(QtWidgets.QWidget):
         self.overlay_widget.setLabel('bottom', 'Time since present', units='s')
         self.overlay_widget.setLabel('left', 'Temperature', units='degC')
         self.overlay_widget.showGrid(x=True, y=True)
+        self.overlay_widget.getViewBox().sigRangeChangedManually.connect(
+            lambda _mask: self._on_range_changed_manually())
         # No addLegend() here on purpose: the tile grid below *is* the legend (each
         # tile shows its curve's color swatch). At 32 channels an in-plot legend
         # overflows the overlay and buries the data it's meant to explain.
@@ -1366,6 +1480,9 @@ class VMMTab(QtWidgets.QWidget):
         select_none_button = QtWidgets.QPushButton('Select None')
         select_none_button.clicked.connect(self.select_none)
         controls_row.addWidget(select_none_button)
+        self.follow_button = make_follow_indicator(self.resume_following)
+        self.follow_button.setFixedWidth(FOLLOW_INDICATOR_WIDTH)
+        controls_row.addWidget(self.follow_button)
         controls_row.addStretch(1)
         bottom_layout.addLayout(controls_row)
 
@@ -1470,6 +1587,16 @@ class VMMTab(QtWidgets.QWidget):
 
     def resume(self):
         self.paused = False
+
+    def _on_range_changed_manually(self):
+        if self.following:
+            self.following = False
+            set_follow_indicator(self.follow_button, following=False)
+
+    def resume_following(self):
+        resume_following_on(self.overlay_widget)
+        self.following = True
+        set_follow_indicator(self.follow_button, following=True)
 
     def alarming_channel_ids(self, evaluator):
         return {cid for cid in self.channel_ids if display_status(evaluator.state_for(cid)) in (DisplayStatus.ALARM, DisplayStatus.STALE)}
