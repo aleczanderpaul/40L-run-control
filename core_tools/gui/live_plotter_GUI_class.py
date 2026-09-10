@@ -15,10 +15,15 @@ from .get_data_for_GUI import get_n_XY_datapoints
 from .models import Channel, Plot, LoggerControl, AggregateTile
 from .decimate import decimate_min_max
 from .data_cache import ScanRunnable
+from .palette import channel_palette
 from core_tools.alarms import AlarmEvaluator, AlarmState, DisplayStatus, display_status
 
 '''Class to handle live plotting and add various controls/buttons in a Qt GUI application.'''
 
+# Curve colors for LiveTab.add_plot()'s multi-channel plots only -- these overlay two
+# or three channels at most, where a short hand-picked cycle is clearer than a
+# generated one. The VMM overlay needs 32 distinct colors and generates its own
+# palette instead (core_tools/gui/palette.py); do not merge the two.
 COLOR_CYCLE = ['y', 'c', 'm', 'r', 'g', 'b', 'w']
 
 LED_COLORS = {'running': '#2ecc71', 'stopped': '#95a5a6', 'crashed': '#e74c3c'}
@@ -51,6 +56,11 @@ SPLITTER_HANDLE_WIDTH = 8
 # keeps the strip's geometry constant whatever the text does, and still avoids the
 # window-width floor an unwrapped, unconstrained label would impose -- see AlarmBanner.
 STATUS_TILE_VALUE_WIDTH = 150
+
+# Side of the color swatch on each VMM tile. The tile grid is the overlay plot's
+# legend (see VMMTab), so this needs to be big enough to read a hue off at a glance
+# without widening a 4-column grid of 32 tiles.
+SWATCH_SIZE = 12
 
 
 def rows_for_window(window_s, log_interval_s):
@@ -1306,17 +1316,27 @@ class OverviewTab(QtWidgets.QWidget):
 
 class VMMTab(QtWidgets.QWidget):
     '''Replaces the wall of 16 individual plots with a 4x4 tile grid (checkbox +
-    current value + alarm color) beside one overlay plot of every checked channel.
-    Curve data is pushed in centrally by LivePlotter._on_scan_finished(); this class
-    only owns the widgets, checkbox state, and tile styling.'''
+    color swatch + current value + alarm color) beside one overlay plot of every
+    checked channel. Curve data is pushed in centrally by
+    LivePlotter._on_scan_finished(); this class only owns the widgets, checkbox
+    state, and tile styling.
+
+    Each tile carries its curve's color swatch, which makes the tile grid the
+    overlay's legend -- a pyqtgraph legend with 32 entries is a wall of text that
+    overflows the plot and makes the colors useless in practice, so the overlay has
+    no legend of its own.'''
 
     def __init__(self, plotter, channel_ids, threshold=None):
         super().__init__()
         self.plotter = plotter
         self.channel_ids = list(channel_ids)
-        self.tiles = {}   # channel_id -> {'frame', 'checkbox', 'value_label'}
+        self.tiles = {}   # channel_id -> {'frame', 'checkbox', 'value_label', 'swatch'}
         self.curves = {}  # channel_id -> PlotDataItem
-        self._colors = {}  # channel_id -> assigned pen color, so alarm highlighting can revert to it
+        # channel_id -> assigned pen color, so alarm highlighting can revert to it and
+        # each tile's swatch can match its curve. Generated up front (before the tiles
+        # are built) from the channel's *index*, so it's identical on every launch --
+        # see core_tools/gui/palette.py.
+        self._colors = {cid: color for cid, color in zip(self.channel_ids, channel_palette(len(self.channel_ids)))}
         self.paused = False
 
         # Overlay plot on top (gets the dominant share of the space -- it's the
@@ -1329,7 +1349,9 @@ class VMMTab(QtWidgets.QWidget):
         self.overlay_widget.setLabel('bottom', 'Time since present', units='s')
         self.overlay_widget.setLabel('left', 'Temperature', units='degC')
         self.overlay_widget.showGrid(x=True, y=True)
-        self.overlay_widget.addLegend()
+        # No addLegend() here on purpose: the tile grid below *is* the legend (each
+        # tile shows its curve's color swatch). At 32 channels an in-plot legend
+        # overflows the overlay and buries the data it's meant to explain.
         splitter.addWidget(self.overlay_widget)
 
         bottom_widget = QtWidgets.QWidget()
@@ -1386,11 +1408,8 @@ class VMMTab(QtWidgets.QWidget):
             line = pg.InfiniteLine(pos=threshold, angle=0, pen=pg.mkPen(ALARM_COLOR, style=QtCore.Qt.DashLine))
             self.overlay_widget.addItem(line)
 
-        for i, channel_id in enumerate(self.channel_ids):
-            channel = self.plotter.channels[channel_id]
-            color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
-            self._colors[channel_id] = color
-            self.curves[channel_id] = self.overlay_widget.plot(pen=color, name=channel.label)
+        for channel_id in self.channel_ids:
+            self.curves[channel_id] = self.overlay_widget.plot(pen=pg.mkPen(self._colors[channel_id], width=1))
 
         outer_layout = QtWidgets.QVBoxLayout()
         outer_layout.addWidget(splitter)
@@ -1414,6 +1433,15 @@ class VMMTab(QtWidgets.QWidget):
         checkbox.stateChanged.connect(lambda state, cid=channel_id: self._on_checkbox_changed(cid, state))
         row.addWidget(checkbox)
 
+        # This swatch is what makes the tile grid the overlay's legend. Fixed-size and
+        # never restyled after construction, so it can't feed a scan tick's text
+        # changes into the grid's geometry.
+        swatch = QtWidgets.QLabel()
+        swatch.setFixedSize(SWATCH_SIZE, SWATCH_SIZE)
+        swatch.setStyleSheet(f"background-color: {self._colors[channel_id]}; border: 1px solid #333;")
+        swatch.setToolTip(f"Overlay curve color for {channel.label}")
+        row.addWidget(swatch)
+
         label = QtWidgets.QLabel(f"VMM {channel.vmm_num} (F{fec}/H{hyb}/V{vmm})")
         label.setStyleSheet("font-size: 10px;")
         row.addWidget(label)
@@ -1424,7 +1452,7 @@ class VMMTab(QtWidgets.QWidget):
         row.addWidget(value_label)
         row.addStretch(1)
 
-        return {'frame': frame, 'checkbox': checkbox, 'value_label': value_label}
+        return {'frame': frame, 'checkbox': checkbox, 'value_label': value_label, 'swatch': swatch}
 
     def _on_checkbox_changed(self, channel_id, state):
         self.curves[channel_id].setVisible(state == QtCore.Qt.Checked)
