@@ -30,11 +30,13 @@ COLOR_CYCLE = ['y', 'c', 'm', 'r', 'g', 'b', 'w']
 LED_COLORS = {'running': '#2ecc71', 'stopped': '#95a5a6', 'crashed': '#e74c3c'}
 ALARM_COLOR = '#e74c3c'
 
-# How often the alarm scanner reads every registered channel and how many trailing
-# rows it fetches per read. Deliberately independent of any plot's own timer (a
-# paused plot must not pause its channels' alarm evaluation) and, for now,
-# independent of the per-plot update() reads too -- both re-read from disk until the
-# shared data cache lands, which is a known, temporary duplication of file reads.
+# How often the alarm scanner reads every registered channel, and the FLOOR on how
+# many trailing rows each read fetches -- a floor for alarm evaluation's benefit
+# only, never a count of points to draw (see rows_to_fetch). Deliberately
+# independent of any plot's own timer (a paused plot must not pause its channels'
+# alarm evaluation) and, for now, independent of the per-plot update() reads too --
+# both re-read from disk until the shared data cache lands, which is a known,
+# temporary duplication of file reads.
 ALARM_SCAN_INTERVAL_MS = 1000
 ALARM_LOOKBACK_ROWS = 50
 
@@ -69,8 +71,32 @@ SWATCH_SIZE = 12
 FOLLOW_INDICATOR_WIDTH = 74
 
 
+# Two different row counts, and conflating them is what made a "1m" window show ~100s
+# of data on every 2s channel:
+#
+#   rows_for_window() is how many rows the WINDOW covers -- what a plot should draw.
+#   rows_to_fetch()   is how many rows the scan READS, which also has to satisfy
+#                     alarm evaluation's ALARM_LOOKBACK_ROWS floor.
+#
+# The floor is larger than the window whenever window_s / log_interval_s < 50 (a 1m
+# window on a 2s channel wants 30 rows), so the two must not be the same number: the
+# scan reads the larger one and _on_scan_finished() trims to the smaller one before
+# drawing. Keep it that way -- reading only rows_for_window() rows would silently
+# shorten alarm evaluation's history at short windows, which is the failure the floor
+# exists to prevent.
 def rows_for_window(window_s, log_interval_s):
     return max(2, math.ceil(window_s / log_interval_s))
+
+
+def rows_to_fetch(window_s, log_interval_s):
+    return max(ALARM_LOOKBACK_ROWS, rows_for_window(window_s, log_interval_s))
+
+
+def tail(values, count):
+    '''The last `count` items of a pandas Series or a plain array. Series.iloc is
+    positional; bare [] slicing on a Series whose index is integer-typed is ambiguous
+    between positional and label-based.'''
+    return values.iloc[-count:] if hasattr(values, 'iloc') else values[-count:]
 
 
 def apply_style(widget, style):
@@ -398,7 +424,7 @@ class LivePlotter:
 
         requests = []
         for channel_id, channel in self.channels.items():
-            n = max(ALARM_LOOKBACK_ROWS, rows_for_window(self.window_seconds, channel.log_interval_s))
+            n = rows_to_fetch(self.window_seconds, channel.log_interval_s)
             requests.append((channel_id, channel.filepath, n, channel.datatype, channel.vmm_num))
 
         runnable = ScanRunnable(requests)
@@ -441,9 +467,16 @@ class LivePlotter:
             if newest_ts is not None:
                 self._alarm_last_ts[channel_id] = newest_ts
 
+            # Alarm evaluation above gets every row the scan read; a plot gets only
+            # the rows its window covers. Those differ whenever the read was raised
+            # to the ALARM_LOOKBACK_ROWS floor -- see rows_to_fetch(). Trim before
+            # decimating, so DECIMATION_CAP is spent on points that will be drawn.
+            window_rows = rows_for_window(self.window_seconds, channel.log_interval_s)
+
             # Decimate once per channel (independent of which plot/offset uses it)
             # and reuse for every consumer of this channel's curve.
-            dec_x, dec_y = decimate_min_max(x_data, y_data, max_points=DECIMATION_CAP)
+            dec_x, dec_y = decimate_min_max(tail(x_data, window_rows), tail(y_data, window_rows),
+                                            max_points=DECIMATION_CAP)
 
             for tab, plot_id in self.channel_plots.get(channel_id, []):
                 plot = tab.plots.get(plot_id)

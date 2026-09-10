@@ -116,7 +116,7 @@ A plain channel id becomes a tile showing its label/value/units. `AggregateTile`
 
 ### Time window and other global controls
 
-The control dock (right-hand pane) also carries: the global time-window selector (`1m`/`5m`/`15m`/`1h`/`6h`/`24h`, persisted via `QSettings`; each plot fetches `ceil(window_s / channel.log_interval_s)` rows, decimated to ~20000 points via min/max-per-bucket bucketing if that's exceeded so a spike is never hidden), Pause All / Resume All (curve redraws only — never affects alarm evaluation), Resume Following (All), and the operator-note input. Acknowledging alarms is done from the alarm banner (Acknowledge / Acknowledge All).
+The control dock (right-hand pane) also carries: the global time-window selector (`1m`/`5m`/`15m`/`1h`/`6h`/`24h`, persisted via `QSettings`; each plot draws `ceil(window_s / channel.log_interval_s)` rows, decimated to ~20000 points via min/max-per-bucket bucketing if that's exceeded so a spike is never hidden. The scan *reads* at least `ALARM_LOOKBACK_ROWS` rows regardless, so alarm evaluation keeps enough history at short windows; the extra rows are trimmed before drawing, which is why the two counts are separate functions — `rows_to_fetch()` and `rows_for_window()`), Pause All / Resume All (curve redraws only — never affects alarm evaluation), Resume Following (All), and the operator-note input. Acknowledging alarms is done from the alarm banner (Acknowledge / Acknowledge All).
 
 ### Operator notes
 
