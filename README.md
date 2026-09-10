@@ -16,6 +16,7 @@ python launch_GUI.py
 - `launch_GUI.py` is the *design* — the only file a scientist needs to touch to add a channel, plot, alarm limit, logger, or status-strip tile. It's declarative: register channels, then plots/tabs that reference them by id.
 - `core_tools/alarms.py` is the alarm state machine. It's pure Python (no Qt) so it can be unit-tested and, later, run headless.
 - Data logging runs in **separate subprocesses** that write plain CSV/DAT files; the GUI only ever reads those files. This is deliberate — logs survive a GUI crash and stay usable for offline analysis. Never move logging into the GUI process.
+- `core_tools/notes.py` is the operator-notes store. Pure Python (no Qt), same reasoning as `alarms.py`.
 - A single scan timer on `LivePlotter` (default 1s) reads every registered channel's file on a background thread, evaluates alarms, and pushes fresh data into every unpaused plot. There's no per-plot timer — pausing a plot only stops its own curve redraw; the channel keeps being evaluated for alarms regardless.
 
 ## launch_GUI.py API
@@ -65,11 +66,21 @@ gas_tab.add_plot(
 
 Multi-channel plots get a real legend (colors are never encoded in the title). Each channel with an `alarm` gets a dashed threshold line (offset-corrected so it still lines up with the trace) and the plot's border/title turn red while any of its channels is in `ALARM`. How much history is shown is governed by the global time-window selector in the control dock, not a per-plot setting.
 
+Each plot's header row carries one current-value readout per channel, a **follow/frozen indicator**, and a pause toggle.
+
+**Follow/frozen.** Zooming or panning a pyqtgraph plot turns its ViewBox's autorange off, after which new data keeps arriving but the visible range stops tracking it — so a plot can look live while showing a frozen window into the past. The indicator answers one question, "am I looking at live data?": `FOLLOWING` (quiet) or `FROZEN` (amber). Clicking it makes the plot live again — unpausing it if it was paused, and re-enabling autorange so the view snaps back to the live time window. **Resume Following (All)** in the control dock re-follows every plot at once (it doesn't unpause — that's Resume All), and changing the time-window selector re-follows too.
+
+A **paused** plot also reads as `FROZEN`, because it isn't showing live data either. The two reasons stay tellable apart: the pause toggle still shows ⏸/▶, and the indicator's tooltip names the actual reason (or both). What differs underneath is that a frozen plot still receives new data and just isn't scrolling to show it, while a paused plot receives none — and neither affects alarm evaluation, which never stops.
+
+Whether a plot is following is derived from the ViewBox's own autorange flags on every `sigStateChanged`, not remembered from a single signal. Autorange is turned off by a zoom or pan and back **on** by three things: the indicator, pyqtgraph's auto-scale button (the small "A" that appears at a plot's bottom left once it's zoomed), and the right-click menu's X/Y "Auto" checkboxes. Watching `sigRangeChangedManually` alone caught the freeze but neither of the latter two ways out of it, which left a stale `FROZEN` badge on a plot that had resumed tracking. Deriving the answer can't drift out of sync that way, and a normal redraw leaves those flags on, so a scan tick never reads as a freeze.
+
+The VMM overlay has its own indicator in its controls row, beside Select All / Select None, and behaves identically.
+
 ### Tabs
 
 - `plotter.build_overview_tab()` — call this **before** any other tab so it lands first. Dashboard of tiles (value + 5-minute sparkline) grouped by each channel's `overview_group`; no live plots. Build it after every `add_channel()` call it should reflect.
 - `plotter.create_tab(tab_name, plots_per_row)` — a regular tab; call `.add_plot(...)` on the result.
-- `plotter.build_vmm_tab(tab_name, channel_ids, threshold=None)` — the VMM Temperatures tab: one overlay plot of every checked channel's curve, with a compact 4-column tile row (checkbox, current value, alarm color) underneath so the plot keeps the dominant share of the space. `threshold=None` derives the single threshold line from the first channel's `AlarmSpec.high`.
+- `plotter.build_vmm_tab(tab_name, channel_ids, threshold=None)` — the VMM Temperatures tab: one overlay plot of every checked channel's curve, with a compact 4-column tile row (checkbox, color swatch, current value, alarm color) underneath so the plot keeps the dominant share of the space. `threshold=None` derives the single threshold line from the first channel's `AlarmSpec.high`. Curve colors come from `core_tools/gui/palette.py`, which generates a visually-distinct color per channel *index* — deterministic, so an operator can learn them, and distinct well past the 32 VMMs the system will eventually have. The tile swatches are the overlay's legend (32 in-plot legend entries would bury the data), so the overlay has none of its own. `COLOR_CYCLE` still colors `LiveTab.add_plot()`'s two- and three-curve plots and is unrelated.
 - The Event Terminal tab is added automatically (by `plotter.run()`, after every tab above) — nothing to declare for it.
 
 ### Logger controls
@@ -105,7 +116,17 @@ A plain channel id becomes a tile showing its label/value/units. `AggregateTile`
 
 ### Time window and other global controls
 
-The control dock (right-hand pane) also carries: the global time-window selector (`1m`/`5m`/`15m`/`1h`/`6h`/`24h`, persisted via `QSettings`; each plot fetches `ceil(window_s / channel.log_interval_s)` rows, decimated to ~20000 points via min/max-per-bucket bucketing if that's exceeded so a spike is never hidden), and Pause All / Resume All (curve redraws only — never affects alarm evaluation). Acknowledging alarms is done from the alarm banner (Acknowledge / Acknowledge All).
+The control dock (right-hand pane) also carries: the global time-window selector (`1m`/`5m`/`15m`/`1h`/`6h`/`24h`, persisted via `QSettings`; each plot fetches `ceil(window_s / channel.log_interval_s)` rows, decimated to ~20000 points via min/max-per-bucket bucketing if that's exceeded so a spike is never hidden), Pause All / Resume All (curve redraws only — never affects alarm evaluation), Resume Following (All), and the operator-note input. Acknowledging alarms is done from the alarm banner (Acknowledge / Acknowledge All).
+
+### Operator notes
+
+A one-line note input, always visible in the control dock (not in the Event Terminal tab — the operator has to be able to jot a note without leaving whatever tab they're watching). Type a note, press Enter, and three things happen:
+
+1. It's logged at a `NOTE` level, so it appears in the Event Terminal and in that day's on-disk event log alongside everything else.
+2. It's appended to **`operator_notes.csv`** in the working directory (columns `timestamp,note`), flushed on every write. The timestamp is `yyyy-MM-dd HH:mm:ss` in naive local time — deliberately the same format every sensor log here uses, so a note lines up with the data it annotates and one analysis script can parse both. This is a first-class data product for offline analysis, same reasoning as the data logs: it survives a GUI crash and any analysis script can read it.
+3. A vertical dotted blue marker is drawn at that timestamp on every plot, including the VMM overlay — styled unlike the dashed red threshold lines so a note is never mistaken for a limit. Hovering a marker shows its text.
+
+Notes are stored as absolute timestamps, but plots use a "seconds since present" X axis, so each marker's X is recomputed as `note_time - now` on every scan tick and drifts left along with the data. Markers outside the current time window are hidden rather than piling up at the left edge. On startup the last 24 h of `operator_notes.csv` is reloaded, so markers survive a restart.
 
 ### Event Terminal
 
@@ -117,4 +138,4 @@ A tab of its own, added after every tab `launch_GUI.py` declares, filterable. Ev
 pytest tests/ -v
 ```
 
-`core_tools/alarms.py` and `core_tools/gui/decimate.py` are pure Python with no Qt dependency, so their test suites run headless with no display. GUI code can also be smoke-tested headlessly with `QT_QPA_PLATFORM=offscreen python launch_GUI.py`.
+`core_tools/alarms.py`, `core_tools/gui/decimate.py`, `core_tools/gui/palette.py` and `core_tools/notes.py` are pure Python with no Qt dependency, so their test suites run headless with no display. GUI code can also be smoke-tested headlessly with `QT_QPA_PLATFORM=offscreen python launch_GUI.py`.
