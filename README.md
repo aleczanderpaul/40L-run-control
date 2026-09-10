@@ -68,9 +68,13 @@ Multi-channel plots get a real legend (colors are never encoded in the title). E
 
 Each plot's header row carries one current-value readout per channel, a **follow/frozen indicator**, and a pause toggle.
 
-**Follow/frozen.** Zooming or panning a pyqtgraph plot turns its ViewBox's autorange off, after which new data keeps arriving but the visible range stops tracking it — so a plot can look live while showing a frozen window into the past. The indicator says which it is: `FOLLOWING` (quiet) or `FROZEN` (amber). Click it to re-enable autorange and snap back to the live time window; **Resume Following (All)** in the control dock does every plot at once, and changing the time-window selector resumes following too. The transition is detected from `ViewBox.sigRangeChangedManually`, which fires only for user zoom/pan — never for the range changes a redraw makes.
+**Follow/frozen.** Zooming or panning a pyqtgraph plot turns its ViewBox's autorange off, after which new data keeps arriving but the visible range stops tracking it — so a plot can look live while showing a frozen window into the past. The indicator answers one question, "am I looking at live data?": `FOLLOWING` (quiet) or `FROZEN` (amber). Clicking it makes the plot live again — unpausing it if it was paused, and re-enabling autorange so the view snaps back to the live time window. **Resume Following (All)** in the control dock re-follows every plot at once (it doesn't unpause — that's Resume All), and changing the time-window selector re-follows too.
 
-Follow/frozen and pause are independent, and easy to confuse if you don't know the difference: a **frozen** plot still receives new data and just isn't scrolling to show it, a **paused** plot receives none, and neither affects alarm evaluation, which never stops. The VMM overlay has its own indicator in its controls row, beside Select All / Select None.
+A **paused** plot also reads as `FROZEN`, because it isn't showing live data either. The two reasons stay tellable apart: the pause toggle still shows ⏸/▶, and the indicator's tooltip names the actual reason (or both). What differs underneath is that a frozen plot still receives new data and just isn't scrolling to show it, while a paused plot receives none — and neither affects alarm evaluation, which never stops.
+
+Whether a plot is following is derived from the ViewBox's own autorange flags on every `sigStateChanged`, not remembered from a single signal. Autorange is turned off by a zoom or pan and back **on** by three things: the indicator, pyqtgraph's auto-scale button (the small "A" that appears at a plot's bottom left once it's zoomed), and the right-click menu's X/Y "Auto" checkboxes. Watching `sigRangeChangedManually` alone caught the freeze but neither of the latter two ways out of it, which left a stale `FROZEN` badge on a plot that had resumed tracking. Deriving the answer can't drift out of sync that way, and a normal redraw leaves those flags on, so a scan tick never reads as a freeze.
+
+The VMM overlay has its own indicator in its controls row, beside Select All / Select None, and behaves identically.
 
 ### Tabs
 
