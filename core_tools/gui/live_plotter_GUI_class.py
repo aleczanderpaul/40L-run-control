@@ -171,6 +171,16 @@ class LivePlotter:
         self.alarm_evaluator = AlarmEvaluator()
         self._alarm_last_ts = {}  # channel_id -> newest absolute timestamp already evaluated
         self._scan_in_flight = False
+        # The in-flight ScanRunnable, held here for the duration of the scan. This is
+        # NOT an unused attribute -- do not delete it. QThreadPool takes C++-side
+        # ownership of the runnable (autoDelete defaults to True), but
+        # runnable.signals is a parentless QObject attribute of a Python object that
+        # nothing else references once _start_scan() returns, so Python is free to
+        # collect it while the worker thread is still running -- and the eventual
+        # .emit() on that thread then raises "wrapped C/C++ object of type
+        # ScanWorkerSignals has been deleted". Only one scan is ever in flight
+        # (_scan_in_flight guarantees it), so one attribute is enough.
+        self._active_scan_runnable = None
         self.scan_timer = QtCore.QTimer()
         self.scan_timer.timeout.connect(self._start_scan)
         self.scan_timer.start(ALARM_SCAN_INTERVAL_MS)
@@ -215,6 +225,9 @@ class LivePlotter:
 
         runnable = ScanRunnable(requests)
         runnable.signals.finished.connect(self._on_scan_finished)
+        # Keep the runnable (and therefore its signals object) alive until
+        # _on_scan_finished runs -- see _active_scan_runnable in __init__.
+        self._active_scan_runnable = runnable
         QtCore.QThreadPool.globalInstance().start(runnable)
 
     # Runs on the GUI thread once the background read completes: feeds newly-arrived
@@ -222,6 +235,7 @@ class LivePlotter:
     # unpaused plot/VMM-overlay curve referencing each channel.
     def _on_scan_finished(self, results):
         self._scan_in_flight = False
+        self._active_scan_runnable = None  # the scan is done; safe to let it be collected
         now = time.time()
 
         for channel_id, result in results.items():
