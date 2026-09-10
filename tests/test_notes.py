@@ -4,10 +4,11 @@ Run with: pytest tests/test_notes.py -v'''
 import csv
 import datetime
 
+import pandas as pd
 import pytest
 
-from core_tools.notes import (COLUMNS, NoteStore, STARTUP_LOOKBACK_S, from_iso,
-                              to_iso, visible_notes)
+from core_tools.notes import (COLUMNS, NoteStore, STARTUP_LOOKBACK_S, TIMESTAMP_FORMAT,
+                              format_timestamp, parse_timestamp, visible_notes)
 
 T = datetime.datetime(2026, 9, 9, 14, 30, 0).astimezone().timestamp()
 
@@ -27,7 +28,7 @@ def test_note_written_at_T_lands_with_that_timestamp(store):
 
     assert len(rows) == 1
     assert rows[0]['note'] == 'opened the bypass valve'
-    assert from_iso(rows[0]['timestamp']) == pytest.approx(T, abs=1)
+    assert parse_timestamp(rows[0]['timestamp']) == pytest.approx(T, abs=1)
 
 
 def test_header_is_written_once(store):
@@ -41,11 +42,43 @@ def test_header_is_written_once(store):
     assert [row[1] for row in rows[1:]] == ['first', 'second']
 
 
-def test_timestamp_is_iso_8601_with_an_explicit_offset(store):
+def test_timestamp_format_matches_the_sensor_logs(store):
+    '''Same 'yyyy-MM-dd HH:mm:ss' the data logs use, so a note lines up with the data
+    it annotates and one script can parse both.'''
     store.append('note', timestamp=T)
     stamp = open(store.filepath, encoding='utf-8').read().splitlines()[1].split(',')[0]
-    parsed = datetime.datetime.fromisoformat(stamp)  # raises if it isn't ISO-8601
-    assert parsed.tzinfo is not None, stamp
+
+    assert stamp == datetime.datetime.fromtimestamp(T).strftime('%Y-%m-%d %H:%M:%S')
+    assert TIMESTAMP_FORMAT == '%Y-%m-%d %H:%M:%S'
+    # parseable by strptime with that exact format, and carrying no timezone
+    assert datetime.datetime.strptime(stamp, TIMESTAMP_FORMAT).tzinfo is None
+
+
+def test_timestamp_parses_the_way_the_data_files_do(store):
+    '''get_seconds_ago() reads the data logs with pandas and this same format string;
+    a notes file has to survive the same treatment.'''
+    store.append('note', timestamp=T)
+    frame = pd.read_csv(store.filepath)
+    parsed = pd.to_datetime(frame['timestamp'], format=TIMESTAMP_FORMAT)
+
+    assert len(parsed) == 1
+    assert parsed.iloc[0].to_pydatetime() == datetime.datetime.fromtimestamp(T).replace(microsecond=0)
+
+
+def test_offset_carrying_rows_from_an_older_version_still_load(store):
+    '''An existing notes file may hold '2026-09-09T14:28:16-10:00' rows written before
+    the format changed. Being strict would make load_recent() skip them, and those
+    notes' markers would quietly stop appearing.'''
+    old_style = datetime.datetime.fromtimestamp(T - 60).astimezone().isoformat(timespec='seconds')
+    with open(store.filepath, 'w', encoding='utf-8') as handle:
+        handle.write('timestamp,note\n')
+        handle.write(f'{old_style},written by the old version\n')
+    store.append('written by this version', timestamp=T)
+
+    loaded = store.load_recent(now=T)
+    assert [note for _, note in loaded] == ['written by the old version',
+                                            'written by this version']
+    assert loaded[0][0] == pytest.approx(T - 60, abs=1)
 
 
 def test_a_note_containing_commas_and_quotes_round_trips(store):
@@ -133,8 +166,8 @@ def test_a_shorter_window_hides_more_notes():
     assert len(visible_notes(notes, now=T, window_s=3600)) == 3
 
 
-def test_iso_round_trip_is_stable_to_the_second():
-    assert from_iso(to_iso(T)) == pytest.approx(T, abs=1)
+def test_timestamp_round_trip_is_stable_to_the_second():
+    assert parse_timestamp(format_timestamp(T)) == pytest.approx(T, abs=1)
 
 
 def test_a_file_too_damaged_to_parse_loads_as_empty(store):
