@@ -84,3 +84,34 @@ class LoggerControl:
     start_stop_button: object = None
     led: object = None
     error_label: object = None
+
+
+@dataclass
+class SetpointControl:
+    '''One Alicat MFC setpoint control. Unlike a LoggerControl, whose subprocess is a
+    long-running logger the dock starts and stops, this fires a short one-shot
+    subprocess per Set press -- there is nothing to stop, so there's no start/stop
+    button and no running/crashed lifecycle, only the outcome of the last command.'''
+    id: str
+    label: str
+    script: str
+    unit_id: str
+    port: str
+    units: str
+    min_value: float
+    max_value: float
+    decimals: int
+    default_value: float
+    confirm: bool
+
+    # Runtime state, populated by ControlDock.add_setpoint_group() and mutated as
+    # commands are sent. `sending` guards against a second command being fired while
+    # one is still in flight on the same serial port.
+    sending: bool = False
+    last_sent_value: float | None = None
+
+    port_combo: object = None
+    value_spinbox: object = None
+    send_button: object = None
+    led: object = None
+    status_label: object = None

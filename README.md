@@ -97,7 +97,37 @@ gas_tab.add_logger_control(
 )
 ```
 
-Builds a group box (LED, port dropdown from `serial.tools.list_ports`, interval dropdown, Start/Stop) in the shared control dock. The subprocess is launched as `[sys.executable, script, log_filepath, port, str(interval)]` — a real argv list, never a shell string, so filenames and ports can contain spaces. An unexpected exit turns the LED red and shows the last stderr line; it never silently flips back to "running". Changing the interval while a logger is running is stashed and applied on the next start.
+Builds a group box (LED, port dropdown from `serial.tools.list_ports`, interval dropdown, Start/Stop) in the shared control dock. The port dropdown always offers the declared port even when it isn't currently enumerated, so a device that's unplugged or off at launch doesn't become unselectable once it's back. The subprocess is launched as `[sys.executable, script, log_filepath, port, str(interval)]` — a real argv list, never a shell string, so filenames and ports can contain spaces. An unexpected exit turns the LED red and shows the last stderr line; it never silently flips back to "running". Changing the interval while a logger is running is stashed and applied on the next start.
+
+### MFC setpoint controls
+
+```python
+gas_tab.add_setpoint_control(
+    id='setpoint_gas_inlet_mfc',
+    label='Gas Inlet MFC',
+    script='alicat_MFC_control.py',
+    unit_id='A',                     # RS-485 address the command is sent to
+    port='COM4',                     # default; overridable from a live port dropdown at runtime
+    units='SLPM',
+    min_value=0.0,
+    max_value=50.0,                  # the controller's configured full scale
+    decimals=2,
+    default_value=0.0,
+    confirm=True,                    # confirmation dialog before each command
+)
+```
+
+Builds a group box in the same control dock as the logger controls (its own block below them): LED, port dropdown, a bounded value box, a Set button, and a one-line result. It is **not** a logger and deliberately doesn't look like one — a setpoint is one command, not a process, so there's no Start/Stop, no interval, and no LED lifecycle to watch. Each press runs `alicat_MFC_control.py` once as `[sys.executable, script, port, unit_id, str(value)]` — note the argument order differs from a logger's `script log_filepath port interval`, because that's the argv the control script takes.
+
+The command runs on a worker thread and reports back through a signal, never on the GUI thread: it opens the serial port, sleeps 1 s for the device, writes and reads, so running it inline would freeze every plot for seconds. While it's in flight the LED is amber and the button is disabled, so a second command can't be fired at the same serial port. `SETPOINT_TIMEOUT_S` (15 s) bounds a controller that never answers.
+
+**A zero exit code does not mean the setpoint took.** `alicat_MFC_control.py` prints `ERROR during set setpoint, output: ...` and still exits 0 when the controller's reply isn't a valid data frame — wrong unit id, setpoint source configured for analog instead of Serial/Front Panel, or nothing on the other end of the line. A command counts as acknowledged only when the process exited cleanly *and* the script says the controller acknowledged (`setpoint_acknowledged()`, unit-tested in `tests/test_setpoint_result.py`); anything else gets a red LED, the reply or stderr line shown in the box, and an `ERROR` line in the Event Terminal. Every attempt is logged either way, with the value, units, port and unit id.
+
+The value box is a hard-bounded spin box rather than a free-text field — the controller accepts whatever it's sent, so `min_value`/`max_value` declared here are the only thing between a typo and 500 SLPM. `confirm=True` (the default) additionally names the value, units, port and unit id in a dialog before the command goes out; pass `confirm=False` for a control where that's more friction than it's worth.
+
+Nothing about this control reads the setpoint back — that's the logger's job. The resulting setpoint shows up on the `gas_inlet_flow_setpoint` channel like any other reading, which is also how an operator confirms the controller is where they put it.
+
+In-flight setpoint commands are **not** killed on GUI shutdown (running loggers are). They're already bounded by the timeout, and killing one mid-write could leave the controller at a value nobody asked for.
 
 ### Status strip
 

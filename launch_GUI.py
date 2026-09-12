@@ -33,6 +33,11 @@ filter_line_H2O_offset = 0
 
 num_vmms = 16
 
+#Gas inlet Alicat MFC -- the setpoint control below commands this unit. max_flow is the
+#controller's configured full scale and is what bounds the GUI's setpoint box, so it has
+#to match the device; the unit id is the RS-485 address the command is sent to.
+gas_inlet_MFC_unit_id = 'A'
+
 create_pressure_log_csv(outer_vessel_pressure_log_filepath)
 create_H2O_log_csv(vaisala_H2O_log_filepath)
 
@@ -173,6 +178,15 @@ pressure_tab.add_logger_control(id='log_ov_pressure', label='OV Pressure', scrip
 pressure_tab.add_logger_control(id='log_h2o', label='H2O Concentration', script='log_H2O_readings.py',
                                  log_filepath=vaisala_H2O_log_filepath, port='COM5',
                                  interval_options=log_interval_options, default_interval=2)
+
+#Gas inlet MFC setpoint -- a one-shot command, not a logger: each press runs
+#alicat_MFC_control.py once and reports whether the controller acknowledged. The
+#resulting setpoint is read back by the Alicat log and plotted as 'gas_inlet_flow_setpoint'.
+pressure_tab.add_setpoint_control(id='setpoint_gas_inlet_mfc', label='Gas Inlet MFC',
+                                   script='alicat_MFC_control.py', unit_id=gas_inlet_MFC_unit_id,
+                                   port='COM4', units='SLPM',
+                                   min_value=0.0, max_value=50.0,
+                                   decimals=2, default_value=0.0)
 
 '''VMM TEMPERATURES TAB -- tile grid + one overlay plot (§5.4), not 16 separate plots'''
 vmm_plot_ids = [f'vmm_temp_{i}' for i in range(num_vmms)]

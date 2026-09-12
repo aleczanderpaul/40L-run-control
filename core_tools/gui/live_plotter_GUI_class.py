@@ -12,7 +12,7 @@ import platform
 import serial.tools.list_ports
 
 from .get_data_for_GUI import get_n_XY_datapoints
-from .models import Channel, Plot, LoggerControl, AggregateTile
+from .models import Channel, Plot, LoggerControl, SetpointControl, AggregateTile
 from .decimate import decimate_min_max
 from .data_cache import ScanRunnable
 from .palette import channel_palette
@@ -27,8 +27,18 @@ from core_tools.alarms import AlarmEvaluator, AlarmState, DisplayStatus, display
 # palette instead (core_tools/gui/palette.py); do not merge the two.
 COLOR_CYCLE = ['y', 'c', 'm', 'r', 'g', 'b', 'w']
 
-LED_COLORS = {'running': '#2ecc71', 'stopped': '#95a5a6', 'crashed': '#e74c3c'}
+# 'running'/'stopped'/'crashed' are a logger's subprocess lifecycle; a setpoint
+# control has no lifecycle to show (its subprocess is one-shot), so it reuses these
+# for the outcome of the last command -- green for acknowledged, red for rejected,
+# grey for "nothing sent yet" -- plus 'sending' while one is in flight.
+LED_COLORS = {'running': '#2ecc71', 'stopped': '#95a5a6', 'crashed': '#e74c3c', 'sending': '#f39c12'}
 ALARM_COLOR = '#e74c3c'
+
+# A setpoint command opens the serial port, sleeps 1s for the device to initialize,
+# writes, and reads with a 1s timeout, so it normally returns in ~2s. This bound is
+# what keeps a controller that never answers from leaving the Set button disabled
+# forever; it must stay comfortably above that normal round trip.
+SETPOINT_TIMEOUT_S = 15
 
 # How often the alarm scanner reads every registered channel, and the FLOOR on how
 # many trailing rows each read fetches -- a floor for alarm evaluation's benefit
@@ -257,6 +267,26 @@ def sync_note_markers(plot_widget, pool, notes):
         line.setVisible(True)
     for line in pool[len(notes):]:
         line.setVisible(False)
+
+
+def last_line(text):
+    """Last non-blank line of a subprocess's captured output, or '' if there is none."""
+    lines = [line.strip() for line in (text or '').splitlines() if line.strip()]
+    return lines[-1] if lines else ''
+
+
+def setpoint_acknowledged(exit_code, reply):
+    """Did the MFC actually take the setpoint?
+
+    The exit code alone cannot answer this: alicat_MFC_control.py prints
+    "ERROR during set setpoint, output: ..." and still exits 0 when the controller's
+    reply isn't a valid data frame -- wrong unit id, setpoint source configured for
+    analog rather than Serial/Front Panel, or nothing on the other end of the line.
+    Treating exit 0 as success would report a command that never landed as applied,
+    with the controller still at its old flow. So both have to hold: the process
+    ran cleanly AND the script says the controller acknowledged.
+    """
+    return exit_code == 0 and reply.startswith('Successfully set setpoint')
 
 
 def limit_description(alarm):
@@ -905,26 +935,49 @@ class LiveTab(QtWidgets.QWidget):
             interval_options=interval_options, default_interval=default_interval,
         )
 
+    # Register an Alicat MFC setpoint control (LED, port, value box, Set) in the same
+    # control dock -- see ControlDock.add_setpoint_group for what this builds and how
+    # it differs from a logger.
+    def add_setpoint_control(self, id, label, script, unit_id, port, units,
+                             min_value, max_value, decimals=2, default_value=0.0, confirm=True):
+        return self.plotter.control_dock.add_setpoint_group(
+            id=id, label=label, script=script, unit_id=unit_id, port=port, units=units,
+            min_value=min_value, max_value=max_value, decimals=decimals,
+            default_value=default_value, confirm=confirm,
+        )
+
 class ControlDock(QtWidgets.QWidget):
     '''Persistent right-hand dock, visible regardless of which tab is selected. Owns
     every logger's structured subprocess lifecycle (LED, port/interval dropdowns,
-    start/stop, crash reporting) -- LiveTab.add_logger_control() just forwards here.'''
+    start/stop, crash reporting) -- LiveTab.add_logger_control() just forwards here --
+    and every MFC setpoint control's one-shot command subprocess
+    (LiveTab.add_setpoint_control()).'''
 
     # stderr is read on a background thread (see _read_stderr); a signal is the only
     # safe way to hand a line back to the GUI thread for logging/widget updates --
     # Qt widgets must never be touched directly from a non-GUI thread.
     stderr_line_received = QtCore.pyqtSignal(str, str)  # logger_id, line
+    # Same reasoning for setpoint commands, which are run to completion on a worker
+    # thread (see _run_setpoint) rather than polled like a logger.
+    setpoint_result_received = QtCore.pyqtSignal(str, int, str, str)  # setpoint_id, exit code, stdout, stderr
 
     def __init__(self, plotter):
         super().__init__()
         self.plotter = plotter
         self.loggers = {}  # id -> LoggerControl
+        self.setpoints = {}  # id -> SetpointControl
 
         self.layout = QtWidgets.QVBoxLayout()
         self.setLayout(self.layout)
 
         self.loggers_layout = QtWidgets.QVBoxLayout()
         self.layout.addLayout(self.loggers_layout)
+
+        # Its own layout, below the loggers: reading and commanding are different
+        # kinds of action, and a Set button must never sit in the same visual block
+        # as a Start/Stop that only affects what gets recorded.
+        self.setpoints_layout = QtWidgets.QVBoxLayout()
+        self.layout.addLayout(self.setpoints_layout)
 
         window_row = QtWidgets.QHBoxLayout()
         window_row.addWidget(QtWidgets.QLabel('Window:'))
@@ -977,6 +1030,7 @@ class ControlDock(QtWidgets.QWidget):
         self.layout.addStretch(1)
 
         self.stderr_line_received.connect(self._on_stderr_line)
+        self.setpoint_result_received.connect(self._on_setpoint_result)
 
         # Polls every logger's subprocess for an unexpected exit; this is deliberately
         # decoupled from any single logger's own start/stop so a crash is caught even
@@ -1029,6 +1083,19 @@ class ControlDock(QtWidgets.QWidget):
             elif isinstance(tab, VMMTab):
                 tab.resume()
 
+    # The declared port is always offered even when it isn't currently enumerated --
+    # a USB adapter that's unplugged (or a device that's off) at launch must not make
+    # its port unselectable once it comes back.
+    @staticmethod
+    def _make_port_combo(port):
+        combo = QtWidgets.QComboBox()
+        available_ports = [p.device for p in serial.tools.list_ports.comports()]
+        if port not in available_ports:
+            available_ports = [port] + available_ports
+        combo.addItems(available_ports)
+        combo.setCurrentText(port)
+        return combo
+
     # Build one logger's group box: LED, port dropdown (from the live serial port
     # list, defaulting to the declared port), interval dropdown, start/stop button,
     # and a hidden error line that appears only on an unexpected exit.
@@ -1051,12 +1118,7 @@ class ControlDock(QtWidgets.QWidget):
         status_row.addStretch(1)
         box_layout.addLayout(status_row)
 
-        port_combo = QtWidgets.QComboBox()
-        available_ports = [p.device for p in serial.tools.list_ports.comports()]
-        if port not in available_ports:
-            available_ports = [port] + available_ports
-        port_combo.addItems(available_ports)
-        port_combo.setCurrentText(port)
+        port_combo = self._make_port_combo(port)
         logger.port_combo = port_combo
         box_layout.addWidget(port_combo)
 
@@ -1188,10 +1250,165 @@ class ControlDock(QtWidgets.QWidget):
                     logger.error_label.show()
                     self.plotter.log(f"Logger {logger.label} exited unexpectedly (code {exit_code}): {last_line}", level='ERROR')
 
+    # Build one MFC setpoint control's group box: LED, port dropdown, a bounded value
+    # box in the controller's engineering units, and a Set button. There is no
+    # start/stop and no interval: a setpoint is one command, not a process. The LED
+    # reports the last command's outcome rather than a running/stopped state.
+    def add_setpoint_group(self, id, label, script, unit_id, port, units,
+                           min_value, max_value, decimals, default_value, confirm):
+        control = SetpointControl(
+            id=id, label=label, script=script, unit_id=unit_id, port=port, units=units,
+            min_value=min_value, max_value=max_value, decimals=decimals,
+            default_value=default_value, confirm=confirm,
+        )
+
+        box = QtWidgets.QGroupBox(f'{label} Setpoint')
+        box_layout = QtWidgets.QVBoxLayout()
+        box.setLayout(box_layout)
+
+        status_row = QtWidgets.QHBoxLayout()
+        led = QtWidgets.QLabel()
+        led.setFixedSize(12, 12)
+        control.led = led
+        status_row.addWidget(led)
+        # The unit id is shown, not just declared: several Alicats can share one RS-485
+        # line, and it is the only thing distinguishing which one a command addresses.
+        status_row.addWidget(QtWidgets.QLabel(f'{label} (unit {unit_id})'))
+        status_row.addStretch(1)
+        box_layout.addLayout(status_row)
+
+        port_combo = self._make_port_combo(port)
+        control.port_combo = port_combo
+        box_layout.addWidget(port_combo)
+
+        value_row = QtWidgets.QHBoxLayout()
+        # A spin box with a hard range, not a free-text field: the controller accepts
+        # whatever it is sent, so the range declared in launch_GUI.py (the device's
+        # full scale) is the one place a fat-fingered 500 for 50 gets caught. It has
+        # to be clamped before the command is built, never validated after the fact.
+        value_spinbox = QtWidgets.QDoubleSpinBox()
+        value_spinbox.setDecimals(decimals)
+        value_spinbox.setRange(min_value, max_value)
+        value_spinbox.setValue(default_value)
+        value_spinbox.setToolTip(f'{min_value:g} to {max_value:g} {units} '
+                                 f'(the controller\'s configured full scale)')
+        control.value_spinbox = value_spinbox
+        value_row.addWidget(value_spinbox)
+        value_row.addWidget(QtWidgets.QLabel(units))
+        box_layout.addLayout(value_row)
+
+        # Hidden until a command has actually been sent -- an empty line here would
+        # read as "no reply", which is a different thing from "nothing asked yet".
+        status_label = QtWidgets.QLabel('')
+        status_label.setStyleSheet('font-size: 10px;')
+        status_label.setWordWrap(True)
+        status_label.hide()
+        control.status_label = status_label
+        box_layout.addWidget(status_label)
+
+        send_button = QtWidgets.QPushButton(f'Set {label}')
+        send_button.clicked.connect(lambda _, sid=id: self._send_setpoint(sid))
+        control.send_button = send_button
+        box_layout.addWidget(send_button)
+
+        self.setpoints[id] = control
+        self._set_led(control, 'stopped')
+        self.setpoints_layout.addWidget(box)
+        return control
+
+    def _send_setpoint(self, setpoint_id):
+        control = self.setpoints[setpoint_id]
+        if control.sending:
+            return  # button is disabled while in flight; this is the belt to that braces
+
+        value = control.value_spinbox.value()
+        port = control.port_combo.currentText()
+
+        # Unlike starting a logger, this moves gas. Confirming names the value, the
+        # units, the port and the unit id, so the operator is checking the actual
+        # command rather than re-reading the number they just typed.
+        if control.confirm:
+            answer = QtWidgets.QMessageBox.question(
+                self, f'Set {control.label} Setpoint',
+                f'Set {control.label} (unit {control.unit_id}) to '
+                f'{value:g} {control.units} on {port}?',
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel)
+            if answer != QtWidgets.QMessageBox.Yes:
+                self.plotter.log(f"[{control.label}] setpoint {value:g} {control.units} cancelled", level='INFO')
+                return
+
+        # Same argv discipline as a logger (a real list, sys.executable), but a
+        # different argument order -- alicat_MFC_control.py takes
+        # <serial_port> <unit_id> <setpoint>, with no log file and no interval.
+        argv = [sys.executable, control.script, port, control.unit_id, f'{value:g}']
+
+        control.sending = True
+        control.last_sent_value = value
+        control.send_button.setEnabled(False)
+        control.send_button.setText('Sending...')
+        control.status_label.hide()
+        self._set_led(control, 'sending')
+        self.plotter.log(f"[{control.label}] sending setpoint {value:g} {control.units} "
+                         f"({port}, unit {control.unit_id})", level='INFO')
+
+        thread = threading.Thread(target=self._run_setpoint, args=(control.id, argv), daemon=True)
+        thread.start()
+
+    def _run_setpoint(self, setpoint_id, argv):
+        # Runs on a background thread -- must not touch Qt widgets or self.plotter
+        # directly. The command opens a serial port and waits on the device, so
+        # running it on the GUI thread would freeze the plots for seconds; emitting
+        # the result marshals it back onto the GUI thread.
+        try:
+            completed = subprocess.run(argv, capture_output=True, text=True, timeout=SETPOINT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            self.setpoint_result_received.emit(setpoint_id, -1, '', f'no reply within {SETPOINT_TIMEOUT_S}s')
+            return
+        except OSError as e:
+            self.setpoint_result_received.emit(setpoint_id, -1, '', str(e))
+            return
+        self.setpoint_result_received.emit(setpoint_id, completed.returncode,
+                                           completed.stdout or '', completed.stderr or '')
+
+    def _on_setpoint_result(self, setpoint_id, exit_code, stdout, stderr):
+        control = self.setpoints.get(setpoint_id)
+        if control is None:
+            return
+
+        control.sending = False
+        control.send_button.setEnabled(True)
+        control.send_button.setText(f'Set {control.label}')
+
+        reply = last_line(stdout)
+        error = last_line(stderr)
+
+        acknowledged = setpoint_acknowledged(exit_code, reply)
+
+        value = control.last_sent_value
+        value_text = f'{value:g} {control.units}' if value is not None else f'? {control.units}'
+        if acknowledged:
+            self._set_led(control, 'running')
+            control.status_label.setStyleSheet('color: #2ecc71; font-size: 10px;')
+            control.status_label.setText(f'{value_text} acknowledged at {time.strftime("%H:%M:%S")}')
+            self.plotter.log(f"[{control.label}] setpoint {value_text} acknowledged", level='INFO')
+        else:
+            detail = reply or error or f'exit code {exit_code}, no output'
+            self._set_led(control, 'crashed')
+            control.status_label.setStyleSheet(f'color: {ALARM_COLOR}; font-size: 10px;')
+            control.status_label.setText(f'{value_text} FAILED: {detail}')
+            # A setpoint that didn't take is exactly the kind of thing that must not
+            # be silently swallowed -- the controller may still be at its old value.
+            self.plotter.log(f"[{control.label}] setpoint {value_text} FAILED: {detail}", level='ERROR')
+        control.status_label.show()
+
     def cleanup(self):
         for logger in self.loggers.values():
             logger.user_stopped = True
             self._kill(logger.process)
+        # In-flight setpoint commands are deliberately NOT killed: they are bounded by
+        # SETPOINT_TIMEOUT_S and killing one mid-write could leave the controller at a
+        # value nobody asked for. Letting it finish is the safe end state.
 
 
 class StatusStrip(QtWidgets.QWidget):
