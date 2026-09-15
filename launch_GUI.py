@@ -34,11 +34,10 @@ filter_line_H2O_offset = 0
 num_vmms = 16
 
 gas_inlet_MFC_unit_id = 'A'
-gas_inlet_MFC_port = 'COM4'
+gas_inlet_MFC_port = 'COM4'   #the shared Alicat bus's port; both units sit on it
 gas_inlet_MFC_unit_type = 'MFC'
 
 filter_line_alicat_unit_id = 'B'
-filter_line_alicat_port = 'COM4'
 filter_line_alicat_unit_type = 'Sensor Only'
 
 create_pressure_log_csv(outer_vessel_pressure_log_filepath)
@@ -175,31 +174,35 @@ pressure_tab.add_logger_control(id='log_ov_pressure', label='OV Pressure', scrip
 pressure_tab.add_logger_control(id='log_h2o', label='H2O Concentration', script='log_H2O_readings.py',
                                  log_filepath=vaisala_H2O_log_filepath, port='COM5',
                                  interval_options=log_interval_options, default_interval=2)
-#Both Alicats log through the same script; unit id and unit type are passed as
-#extra_args, which the dock inserts between the port and the interval to match
-#log_Alicat_readings.py's <log_filepath> <port> <unit_id> <unit_type> <interval>.
-#WARNING: both units share one RS-485 bus behind one USB adapter, and a serial port has
-#exactly one owner. Only ONE of these two loggers can run at a time, and while either
-#runs the MFC setpoint control -- and so the over-pressure interlock -- cannot open the
-#port. Polling both units at once needs a single process that owns the bus.
+#SHARED SERIAL BUS -- declared here, immediately above the controls that attach to it:
+#the dock lays these out in declaration order, and a bus belongs next to the controls
+#whose state it explains. It must come before them regardless, since each one validates
+#the reference and raises on a bad one.
+plotter.add_serial_bus(id='alicat_bus', label='Alicat Bus', script='alicat_bus_server.py',
+                        port=gas_inlet_MFC_port)
+
+#Both Alicats sit on one RS-485 bus behind one USB adapter, and a serial port has
+#exactly one owner -- so these two loggers and the MFC setpoint below all attach to the
+#shared bus declared above instead of each opening the port themselves. The bus process
+#opens the port when the first of the three needs it and closes it when the last is
+#done, so logging both units and commanding the setpoint work at the same time.
 pressure_tab.add_logger_control(id='log_gas_inlet_alicat', label='Gas Inlet Alicat',
-                                 script='log_Alicat_readings.py',
-                                 log_filepath=alicat_gas_inlet_log_filepath, port=gas_inlet_MFC_port,
-                                 extra_args=[gas_inlet_MFC_unit_id, gas_inlet_MFC_unit_type],
+                                 bus='alicat_bus', unit_id=gas_inlet_MFC_unit_id,
+                                 unit_type=gas_inlet_MFC_unit_type,
+                                 log_filepath=alicat_gas_inlet_log_filepath,
                                  interval_options=log_interval_options, default_interval=2)
 pressure_tab.add_logger_control(id='log_filter_line_alicat', label='Filter Line Alicat',
-                                 script='log_Alicat_readings.py',
-                                 log_filepath=alicat_filter_line_log_filepath, port=filter_line_alicat_port,
-                                 extra_args=[filter_line_alicat_unit_id, filter_line_alicat_unit_type],
+                                 bus='alicat_bus', unit_id=filter_line_alicat_unit_id,
+                                 unit_type=filter_line_alicat_unit_type,
+                                 log_filepath=alicat_filter_line_log_filepath,
                                  interval_options=log_interval_options, default_interval=2)
 
-#Gas inlet MFC setpoint -- a one-shot command, not a logger: each press runs
-#alicat_MFC_setpoint_control.py once and reports whether the controller acknowledged.
-#The resulting setpoint is read back by the Gas Inlet Alicat logger above and plotted
-#as 'gas_inlet_flow_setpoint'.
+#Gas inlet MFC setpoint -- a one-shot command, not a logger: each press sends one
+#setpoint over the shared bus above and reports whether the controller acknowledged.
+#The resulting setpoint is read back by the Gas Inlet Alicat logger and plotted as
+#'gas_inlet_flow_setpoint'.
 pressure_tab.add_setpoint_control(id='setpoint_gas_inlet_mfc', label='Gas Inlet MFC',
-                                   script='alicat_MFC_setpoint_control.py', unit_id=gas_inlet_MFC_unit_id,
-                                   port=gas_inlet_MFC_port, units='SLPM',
+                                   bus='alicat_bus', unit_id=gas_inlet_MFC_unit_id, units='SLPM',
                                    min_value=0.0, max_value=50.0,
                                    decimals=2, default_value=0.0)
 

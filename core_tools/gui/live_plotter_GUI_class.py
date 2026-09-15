@@ -10,9 +10,10 @@ import subprocess
 import threading
 import platform
 import serial.tools.list_ports
+import json
 
 from .get_data_for_GUI import get_n_XY_datapoints
-from .models import Channel, Plot, LoggerControl, SetpointControl, Interlock, AggregateTile
+from .models import Channel, Plot, LoggerControl, SetpointControl, SerialBus, Interlock, AggregateTile
 from .decimate import decimate_min_max
 from .data_cache import ScanRunnable
 from .palette import channel_palette
@@ -48,6 +49,12 @@ SETPOINT_TIMEOUT_S = 15
 # red and in the log, that the gas has to be shut manually.
 INTERLOCK_RETRY_DELAY_S = 2.0
 INTERLOCK_MAX_ATTEMPTS = 5
+
+# How many consecutive rejected frames a bus unit may have before its control goes
+# red. Frame errors (a mis-addressed reply, a short read) are usually transient and
+# the next poll clears them; a port failure is not debounced at all, because a port
+# that will not open is broken right now.
+BUS_POLL_ERRORS_BEFORE_FAULT = 3
 
 # How often the alarm scanner reads every registered channel, and the FLOOR on how
 # many trailing rows each read fetches -- a floor for alarm evaluation's benefit
@@ -287,15 +294,21 @@ def last_line(text):
 def setpoint_acknowledged(exit_code, reply):
     """Did the MFC actually take the setpoint?
 
-    The exit code alone cannot answer this: alicat_MFC_control.py prints
+    The exit code alone cannot answer this: the Alicat control script prints
     "ERROR during set setpoint, output: ..." and still exits 0 when the controller's
     reply isn't a valid data frame -- wrong unit id, setpoint source configured for
     analog rather than Serial/Front Panel, or nothing on the other end of the line.
     Treating exit 0 as success would report a command that never landed as applied,
     with the controller still at its old flow. So both have to hold: the process
     ran cleanly AND the script says the controller acknowledged.
+
+    Matched on the leading word alone, deliberately. The rest of that sentence is a
+    human-readable message that has already been reworded once ('Successfully set
+    setpoint' -> 'Successfully set Alicat MFC setpoint'), and a longer prefix silently
+    turned every successful command into a reported failure -- which for the interlock
+    means crying wolf on a safe-value command that actually landed.
     """
-    return exit_code == 0 and reply.startswith('Successfully set setpoint')
+    return exit_code == 0 and reply.lower().startswith('successfully')
 
 
 def interlock_should_trip(transition, trigger_channel_ids, trip_on_stale):
@@ -325,26 +338,66 @@ def interlock_reset_blockers(alarm_states):
     """Which trigger channels are not confirmed good, as [(channel_id, reason)].
 
     Used for two things that turn out to be the same question: whether an interlock
-    may arm, and whether a tripped one may be reset. Both need every trigger channel
-    *confirmed good* -- not merely "not in ALARM". STALE and NO_DATA both mean the
-    pressure is currently unknown, and letting gas into a vessel whose pressure nobody
-    can see is exactly what the interlock exists to prevent.
+    may arm, and whether a tripped one may be reset. Both need the vessel's pressure
+    to be currently *knowable* -- ALARM and STALE block, because letting gas into a
+    vessel reading high, or one whose readings have stopped arriving, is exactly what
+    the interlock exists to prevent.
 
-    A channel that has produced no data at all blocks too. ChannelAlarmState starts at
-    OK before anything has been read, so reading that default as a good sample would
+    A channel in NO_DATA does NOT block, as long as some other trigger channel is
+    reading. NO_DATA is how core_tools/alarms.py represents a deliberately-off gauge
+    ('Off' in the log -> NaN), and the 40L's low-range OV gauge is switched off above
+    ~1 Torr -- so requiring every channel to read OK meant the interlock could never
+    arm during normal operation, and would not have tripped at 765 Torr. That also
+    contradicted the trip rule, which already ignores NO_DATA for the same reason: an
+    intentionally-off gauge is not a fault, it is just not the gauge in use right now.
+
+    What must never happen is arming with no usable gauge at all, so when NOTHING is
+    reading OK every non-OK channel blocks, NO_DATA included.
+
+    A channel that has produced no data at all always blocks. ChannelAlarmState starts
+    at OK before anything has been read, so reading that default as a good sample would
     arm the interlock on a channel nobody has heard from -- and it would then trip the
     moment the scan noticed the log file was stale, which is every launch made before
     the logger is started.
 
     An empty list means armed / resettable.
     """
+    any_reading = any(state.state == AlarmState.OK and state.last_timestamp is not None
+                      for state in alarm_states.values())
     blockers = []
     for channel_id, state in alarm_states.items():
         if state.last_timestamp is None:
             blockers.append((channel_id, 'no data yet'))
-        elif state.state != AlarmState.OK:
+        elif state.state in (AlarmState.ALARM, AlarmState.STALE):
+            blockers.append((channel_id, state.state.value))
+        elif state.state == AlarmState.NO_DATA and not any_reading:
             blockers.append((channel_id, state.state.value))
     return blockers
+
+
+def _check_transport(kind, control_id, bus_id, buses, script, port):
+    """A control talks over a shared bus or over its own subprocess -- never both, and
+    never neither.
+
+    Declaring a bus AND a script/port used to be accepted and the script/port silently
+    ignored, which left arguments sitting in launch_GUI.py that read as load-bearing
+    and were not: someone would later 'fix' a bug by editing a script nothing runs.
+    Raising here keeps a declaration from describing something the control doesn't do.
+    """
+    if bus_id is not None:
+        if bus_id not in buses:
+            raise ValueError(f"{kind} {control_id!r}: no serial bus {bus_id!r} "
+                             f"(declare it before the controls that share it; known: {sorted(buses)})")
+        extra = [name for name, value in (('script', script), ('port', port)) if value is not None]
+        if extra:
+            raise ValueError(f"{kind} {control_id!r}: {' and '.join(extra)} cannot be combined with "
+                             f"bus={bus_id!r} -- the bus owns the port and does the talking, "
+                             f"so these would be ignored")
+        return
+    missing = [name for name, value in (('script', script), ('port', port)) if value is None]
+    if missing:
+        raise ValueError(f"{kind} {control_id!r}: needs {' and '.join(missing)} "
+                         f"(or bus=... to attach it to a shared serial bus)")
 
 
 def limit_description(alarm):
@@ -670,6 +723,12 @@ class LivePlotter:
             plot.plot_widget.setTitle(plot.title)
 
     # Create a tab in the window to put plots and buttons in
+    # Declared on the plotter, not on a tab: a bus is a piece of hardware topology,
+    # not part of any tab's display. Declare it BEFORE the controls that attach to it
+    # -- each of those validates the reference and raises on a bad one.
+    def add_serial_bus(self, id, label, script, port):
+        return self.control_dock.add_serial_bus_group(id=id, label=label, script=script, port=port)
+
     # Declared on the plotter, not on a tab: an interlock is a system-wide safety
     # rule, not part of any one tab's display. Declare it AFTER the setpoint control
     # and the trigger channels it names -- it validates every reference immediately
@@ -1005,23 +1064,25 @@ class LiveTab(QtWidgets.QWidget):
 
     # Register a logger's controls (LED, port, interval, start/stop) in the shared
     # control dock -- see ControlDock.add_logger_group for what this actually builds.
-    def add_logger_control(self, id, label, script, log_filepath, port, interval_options,
-                           default_interval, extra_args=None):
+    def add_logger_control(self, id, label, log_filepath, interval_options, default_interval,
+                           script=None, port=None, extra_args=None, bus=None,
+                           unit_id=None, unit_type=None):
         return self.plotter.control_dock.add_logger_group(
             id=id, label=label, script=script, log_filepath=log_filepath, port=port,
             interval_options=interval_options, default_interval=default_interval,
-            extra_args=extra_args,
+            extra_args=extra_args, bus_id=bus, unit_id=unit_id, unit_type=unit_type,
         )
 
     # Register an Alicat MFC setpoint control (LED, port, value box, Set) in the same
     # control dock -- see ControlDock.add_setpoint_group for what this builds and how
     # it differs from a logger.
-    def add_setpoint_control(self, id, label, script, unit_id, port, units,
-                             min_value, max_value, decimals=2, default_value=0.0, confirm=True):
+    def add_setpoint_control(self, id, label, unit_id, units, min_value, max_value,
+                             script=None, port=None, decimals=2, default_value=0.0,
+                             confirm=True, bus=None):
         return self.plotter.control_dock.add_setpoint_group(
             id=id, label=label, script=script, unit_id=unit_id, port=port, units=units,
             min_value=min_value, max_value=max_value, decimals=decimals,
-            default_value=default_value, confirm=confirm,
+            default_value=default_value, confirm=confirm, bus_id=bus,
         )
 
 class ControlDock(QtWidgets.QWidget):
@@ -1038,6 +1099,10 @@ class ControlDock(QtWidgets.QWidget):
     # Same reasoning for setpoint commands, which are run to completion on a worker
     # thread (see _run_setpoint) rather than polled like a logger.
     setpoint_result_received = QtCore.pyqtSignal(str, int, str, str)  # setpoint_id, exit code, stdout, stderr
+    # A shared bus reports on stdout (protocol events) and stderr (crashes); both are
+    # read on background threads, so both come back through signals.
+    bus_event_received = QtCore.pyqtSignal(str, str)   # bus_id, one JSON line
+    bus_stderr_received = QtCore.pyqtSignal(str, str)  # bus_id, line
 
     def __init__(self, plotter):
         super().__init__()
@@ -1045,23 +1110,80 @@ class ControlDock(QtWidgets.QWidget):
         self.loggers = {}  # id -> LoggerControl
         self.setpoints = {}  # id -> SetpointControl
         self.interlocks = {}  # id -> Interlock
+        self.buses = {}  # id -> SerialBus
 
         self.layout = QtWidgets.QVBoxLayout()
         self.setLayout(self.layout)
 
-        self.loggers_layout = QtWidgets.QVBoxLayout()
-        self.layout.addLayout(self.loggers_layout)
+        # Pinned above the scroll area: a red LED is only useful if it can be seen,
+        # and once the instrument boxes scroll, a faulted one can be off screen. This
+        # does for the dock what the alarm banner does for channels -- names what is
+        # wrong, and scrolls to it when clicked. Hidden whenever nothing is wrong.
+        self.fault_summary = QtWidgets.QLabel('')
+        self.fault_summary.setWordWrap(True)
+        self.fault_summary.setCursor(QtCore.Qt.PointingHandCursor)
+        self.fault_summary.mousePressEvent = self._on_fault_summary_clicked
+        self.fault_summary.hide()
+        self.layout.addWidget(self.fault_summary)
+
+        # The instrument boxes scroll; the global controls below them do not. Together
+        # they wanted ~1256px of height with a ~1208px MINIMUM, and a Qt layout minimum
+        # overrides the maximized window state -- so on anything short of a 1440p
+        # screen the dock forced the whole window taller than the display. Only the
+        # boxes move into the scroll area: the window selector, pause/resume and the
+        # note input are used constantly and must never scroll away, and they are small
+        # enough (~194px) to stay pinned. Two columns was the alternative and doesn't
+        # fit -- the dock is only ~320-384px wide at the default splitter ratio, so the
+        # fault lines would wrap to eight-plus lines and a faulted box would end up
+        # TALLER than a healthy one.
+        self._scroll = QtWidgets.QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        # With the horizontal bar off, the content's minimum WIDTH still propagates out
+        # to the dock, so the splitter can't collapse it narrower than a Start button
+        # -- while the height, the dimension that was overflowing, is free to scroll.
+        # Leaving it on AsNeeded would let the dock shrink to nothing and scroll
+        # sideways, which for a column of fixed-width buttons is just worse.
+        self._scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        instruments = QtWidgets.QWidget()
+        instruments_layout = QtWidgets.QVBoxLayout()
+        instruments_layout.setContentsMargins(0, 0, 0, 0)
+        instruments.setLayout(instruments_layout)
+
+        # Each section is a real widget, not a bare nested QVBoxLayout. A layout added
+        # to another layout does not reliably push a size change up the chain when a
+        # widget is added to it later, so the scroll content reported a height of 0 and
+        # the scroll area concluded everything fit -- no scrollbar, content clipped. A
+        # widget's sizeHint does propagate, via updateGeometry, which is what makes the
+        # scroll area notice the content grew.
+        def section():
+            holder = QtWidgets.QWidget()
+            holder_layout = QtWidgets.QVBoxLayout()
+            holder_layout.setContentsMargins(0, 0, 0, 0)
+            holder.setLayout(holder_layout)
+            instruments_layout.addWidget(holder)
+            return holder_layout
+
+        # Buses and loggers share one layout, filled in declaration order, so a bus
+        # sits directly above the controls that attach to it rather than in a block of
+        # its own -- grouping by widget type instead put unrelated instruments between
+        # a bus and the controls it serves, which is precisely what it has to explain.
+        self.loggers_layout = section()
 
         # Its own layout, below the loggers: reading and commanding are different
         # kinds of action, and a Set button must never sit in the same visual block
         # as a Start/Stop that only affects what gets recorded.
-        self.setpoints_layout = QtWidgets.QVBoxLayout()
-        self.layout.addLayout(self.setpoints_layout)
+        self.setpoints_layout = section()
 
         # Below the control each one latches, so the trip state and the locked Set
         # button read as one thing.
-        self.interlocks_layout = QtWidgets.QVBoxLayout()
-        self.layout.addLayout(self.interlocks_layout)
+        self.interlocks_layout = section()
+
+        instruments_layout.addStretch(1)
+        self._scroll.setWidget(instruments)
+        # The only stretchy thing in the dock, so every pixel the pinned rows don't
+        # need goes to showing instruments.
+        self.layout.addWidget(self._scroll, 1)
 
         window_row = QtWidgets.QHBoxLayout()
         window_row.addWidget(QtWidgets.QLabel('Window:'))
@@ -1111,9 +1233,9 @@ class ControlDock(QtWidgets.QWidget):
         note_row.addWidget(self.note_input)
         self.layout.addLayout(note_row)
 
-        self.layout.addStretch(1)
-
         self.stderr_line_received.connect(self._on_stderr_line)
+        self.bus_event_received.connect(self._on_bus_event)
+        self.bus_stderr_received.connect(self._on_bus_stderr)
         self.setpoint_result_received.connect(self._on_setpoint_result)
 
         # Polls every logger's subprocess for an unexpected exit; this is deliberately
@@ -1124,7 +1246,42 @@ class ControlDock(QtWidgets.QWidget):
         # Same timer, separate concern: retries a tripped interlock's unconfirmed
         # command and keeps its Reset button in step with the live alarm states.
         self._status_timer.timeout.connect(self._service_interlocks)
+        self._status_timer.timeout.connect(self._refresh_fault_summary)
         self._status_timer.start(500)
+
+    # Everything currently wrong, in the order it appears in the dock, as
+    # [(what, its group box)]. Recomputed from state each tick rather than maintained
+    # incrementally: a dozen call sites setting a flag is a dozen chances to leave the
+    # summary claiming all-clear over a red LED.
+    def _current_faults(self):
+        faults = []
+        for bus in self.buses.values():
+            if bus.port_fault is not None:
+                faults.append((f'{bus.label} port', bus.box))
+        for logger in self.loggers.values():
+            if logger.faulted:
+                faults.append((logger.label, logger.box))
+        for interlock in self.interlocks.values():
+            if interlock.tripped:
+                faults.append((f'{interlock.label} TRIPPED', interlock.box))
+        return faults
+
+    def _refresh_fault_summary(self):
+        faults = self._current_faults()
+        if not faults:
+            self.fault_summary.hide()
+            return
+        names = ', '.join(name for name, _ in faults)
+        self.fault_summary.setStyleSheet(
+            f'color: white; background-color: {ALARM_COLOR}; font-weight: bold; '
+            f'font-size: 10px; padding: 4px; border-radius: 3px;')
+        self.fault_summary.setText(f'⚠ {names} — click to show')
+        self.fault_summary.show()
+
+    def _on_fault_summary_clicked(self, event):
+        faults = self._current_faults()
+        if faults and faults[0][1] is not None:
+            self._scroll.ensureWidgetVisible(faults[0][1])
 
     def _on_note_entered(self):
         if self.plotter.add_operator_note(self.note_input.text()) is not None:
@@ -1183,15 +1340,304 @@ class ControlDock(QtWidgets.QWidget):
         combo.setCurrentText(port)
         return combo
 
+    # Build one shared bus's group box: LED, the port dropdown (which lives here, not
+    # on the controls -- there is one physical port and showing three copies of it
+    # invited exactly the confusion this class exists to remove), and a line naming
+    # what currently holds it open.
+    def add_serial_bus_group(self, id, label, script, port):
+        bus = SerialBus(id=id, label=label, script=script, port=port)
+
+        box = QtWidgets.QGroupBox(f'{label} (shared port)')
+        box_layout = QtWidgets.QVBoxLayout()
+        box.setLayout(box_layout)
+
+        status_row = QtWidgets.QHBoxLayout()
+        led = QtWidgets.QLabel()
+        led.setFixedSize(12, 12)
+        bus.led = led
+        status_row.addWidget(led)
+        status_row.addWidget(QtWidgets.QLabel(label))
+        status_row.addStretch(1)
+        box_layout.addLayout(status_row)
+
+        port_combo = self._make_port_combo(port)
+        # Changing the port under a running bus would silently leave every attached
+        # control talking to the old one, so it is locked while anything holds it.
+        port_combo.currentTextChanged.connect(lambda _, bid=id: self._refresh_bus(self.buses[bid]))
+        bus.port_combo = port_combo
+        box_layout.addWidget(port_combo)
+
+        status_label = QtWidgets.QLabel('')
+        status_label.setStyleSheet('font-size: 10px; color: #7f8c8d;')
+        status_label.setWordWrap(True)
+        bus.status_label = status_label
+        box_layout.addWidget(status_label)
+
+        bus.box = box
+        self.buses[id] = bus
+        self._set_led(bus, 'stopped')
+        self._refresh_bus(bus)
+        self.loggers_layout.addWidget(box)
+        return bus
+
+    def _refresh_bus(self, bus):
+        running = bus.process is not None and bus.process.poll() is None
+        bus.port_combo.setEnabled(not running)
+        # Checked before "is it running": a fault normally stops every control on the
+        # bus and so closes it, and a box reading a placid "Closed" would hide the
+        # reason the controls next to it just went red.
+        if bus.port_fault is not None:
+            self._set_led(bus, 'crashed')
+            bus.status_label.setStyleSheet(f'color: {ALARM_COLOR}; font-weight: bold; font-size: 10px;')
+            retry = 'Retrying.' if running else 'Start a control to try again.'
+            # The driver's message usually ends in a period of its own.
+            bus.status_label.setText(f'CANNOT OPEN {bus.port_combo.currentText()} — '
+                                     f'{bus.port_fault.rstrip(". ")}. {retry}')
+            return
+        if not running:
+            self._set_led(bus, 'stopped')
+            bus.status_label.setStyleSheet('font-size: 10px; color: #7f8c8d;')
+            bus.status_label.setText('Closed — opens automatically when a control below needs it')
+            return
+        names = sorted(self._bus_user_label(bus, user) for user in bus.users)
+        self._set_led(bus, 'running')
+        bus.status_label.setStyleSheet('font-size: 10px; color: #2ecc71;')
+        bus.status_label.setText(f'Open on {bus.port_combo.currentText()} — '
+                                 f'{", ".join(names) if names else "closing"}')
+
+    def _bus_user_label(self, bus, user_id):
+        base = user_id.split(':', 1)[0]
+        if base in self.loggers:
+            return self.loggers[base].label
+        if base in self.setpoints:
+            return f'{self.setpoints[base].label} (command)'
+        return base
+
+    # Opening the port is a side effect of something needing it, never an explicit
+    # operator action -- which is what makes "open on first use, close on last" hold
+    # without anyone having to remember to do either.
+    def _acquire_bus(self, bus, user_id):
+        if bus.process is None or bus.process.poll() is not None:
+            if not self._start_bus(bus):
+                return False
+        bus.users.add(user_id)
+        self._refresh_bus(bus)
+        return True
+
+    def _release_bus(self, bus, user_id):
+        bus.users.discard(user_id)
+        if not bus.users:
+            self._stop_bus(bus)
+        self._refresh_bus(bus)
+
+    def _start_bus(self, bus):
+        port = bus.port_combo.currentText()
+        argv = [sys.executable, bus.script, port]
+        try:
+            process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True, bufsize=1)
+        except OSError as e:
+            self.plotter.log(f"[{bus.label}] could not start bus: {e}", level='ERROR')
+            return False
+
+        bus.process = process
+        bus.ready = False
+        bus.port_fault = None  # a fresh attempt starts from a clean slate
+        bus.user_stopped = False
+        bus.stderr_lines = []
+
+        # stdout carries the protocol, stderr carries crashes; both are read off the
+        # GUI thread and handed back by signal.
+        threading.Thread(target=self._read_bus_stdout, args=(bus,), daemon=True).start()
+        threading.Thread(target=self._read_bus_stderr, args=(bus,), daemon=True).start()
+
+        self.plotter.log(f"[{bus.label}] opened {port}", level='INFO')
+        return True
+
+    def _stop_bus(self, bus):
+        if bus.process is None:
+            return
+        bus.user_stopped = True
+        try:
+            if bus.process.poll() is None:
+                bus.process.stdin.write(json.dumps({'cmd': 'quit'}) + '\n')
+                bus.process.stdin.flush()
+                bus.process.wait(timeout=3)  # let it close the port cleanly
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        self._kill(bus.process)
+        bus.process = None
+        bus.ready = False
+        self.plotter.log(f"[{bus.label}] closed {bus.port_combo.currentText()}", level='INFO')
+
+    def _send_bus(self, bus, command):
+        if bus.process is None or bus.process.poll() is not None:
+            return False
+        try:
+            bus.process.stdin.write(json.dumps(command) + '\n')
+            bus.process.stdin.flush()
+            return True
+        except (OSError, ValueError) as e:
+            self.plotter.log(f"[{bus.label}] command failed: {e}", level='ERROR')
+            return False
+
+    def _read_bus_stdout(self, bus):
+        # Background thread -- must not touch Qt widgets. Emitting marshals to the GUI.
+        stream = bus.process.stdout
+        if stream is None:
+            return
+        for line in stream:
+            line = line.strip()
+            if line:
+                self.bus_event_received.emit(bus.id, line)
+
+    def _read_bus_stderr(self, bus):
+        stream = bus.process.stderr
+        if stream is None:
+            return
+        for line in stream:
+            line = line.rstrip('\n')
+            if line:
+                self.bus_stderr_received.emit(bus.id, line)
+
+    def _on_bus_stderr(self, bus_id, line):
+        bus = self.buses.get(bus_id)
+        if bus is None:
+            return
+        bus.stderr_lines.append(line)
+        if len(bus.stderr_lines) > 200:
+            bus.stderr_lines.pop(0)
+        self.plotter.log(f"[{bus.label}] {line}", level='ERROR')
+
+    def _on_bus_event(self, bus_id, raw):
+        bus = self.buses.get(bus_id)
+        if bus is None:
+            return
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            self.plotter.log(f"[{bus.label}] unparseable event: {raw}", level='ERROR')
+            return
+
+        kind = event.get('event')
+        if kind == 'ready':
+            bus.ready = True
+            self._refresh_bus(bus)
+        elif kind == 'set_result':
+            self._on_bus_set_result(bus, event)
+        elif kind == 'polled':
+            self._on_bus_unit_polled(bus, event.get('unit_id'))
+        elif kind == 'poll_error':
+            # Not fatal -- one dropped or mis-addressed frame is skipped rather than
+            # written, and the next poll tries again. Logged so a bus that is dropping
+            # frames steadily is visible rather than silently thinning the data, and
+            # counted so a unit that never answers stops looking healthy.
+            self.plotter.log(f"[{bus.label}] unit {event.get('unit_id')}: "
+                             f"{event.get('detail')}", level='ERROR')
+            self._on_bus_unit_poll_error(bus, event.get('unit_id'), event.get('detail', ''))
+        elif kind == 'port_error':
+            self._on_bus_port_fault(bus, event.get('detail', 'port unavailable'))
+        elif kind == 'port_ok':
+            self._on_bus_port_ok(bus)
+        elif kind == 'error':
+            self.plotter.log(f"[{bus.label}] {event.get('detail')}", level='ERROR')
+
+    # A port fault is shown at once, with no debounce: the bus process being alive
+    # says nothing about the port, so this is the only thing standing between the
+    # operator and a green LED over a port that cannot be opened.
+    def _on_bus_port_fault(self, bus, detail):
+        if bus.port_fault == detail:
+            return
+        bus.port_fault = detail
+        self.plotter.log(f"[{bus.label}] {bus.port_combo.currentText()} unavailable: {detail}",
+                         level='ERROR')
+        for logger in list(self.loggers.values()):
+            if logger.bus_id == bus.id and logger.running:
+                self._fault_bus_logger(logger, f'{bus.label}: {detail}')
+        self._refresh_bus(bus)
+
+    def _on_bus_port_ok(self, bus):
+        if bus.port_fault is None:
+            return
+        bus.port_fault = None
+        self.plotter.log(f"[{bus.label}] {bus.port_combo.currentText()} recovered", level='INFO')
+        self._refresh_bus(bus)
+
+    def _on_bus_unit_polled(self, bus, unit_id):
+        logger = self._bus_logger_for(bus, unit_id)
+        if logger is None or not logger.running:
+            return
+        logger.poll_errors = 0
+        logger.last_poll_error = ''
+
+    def _on_bus_unit_poll_error(self, bus, unit_id, detail):
+        logger = self._bus_logger_for(bus, unit_id)
+        if logger is None or not logger.running:
+            return
+        logger.poll_errors += 1
+        logger.last_poll_error = detail
+        if logger.poll_errors >= BUS_POLL_ERRORS_BEFORE_FAULT:
+            self._fault_bus_logger(logger, f'{logger.poll_errors} bad frames in a row: {detail}')
+
+    def _bus_logger_for(self, bus, unit_id):
+        for logger in self.loggers.values():
+            if logger.bus_id == bus.id and logger.unit_id == unit_id:
+                return logger
+        return None
+
+    # Ends a bus logger the same way _poll_loggers ends one whose subprocess died:
+    # red LED, the reason on its group box, and the button back to Start. Leaving it
+    # "running" with a Stop button while it is plainly not logging is the half-state
+    # that made a broken bus look like a working one -- a control either is running or
+    # it is not, and the button has to say which.
+    def _fault_bus_logger(self, logger, detail):
+        if not logger.running:
+            return
+        bus = self.buses[logger.bus_id]
+        self._send_bus(bus, {'cmd': 'stop', 'unit_id': logger.unit_id})
+        logger.running = False
+        logger.user_stopped = False
+        logger.poll_errors = 0
+        logger.last_poll_error = ''
+        logger.faulted = True
+        logger.start_stop_button.setText(f'Start {logger.label}')
+        logger.start_stop_button.setStyleSheet("background-color: green;")
+        self._set_led(logger, 'crashed')
+        logger.error_label.setText(detail)
+        logger.error_label.show()
+        self.plotter.log(f"Logger {logger.label} stopped: {detail}", level='ERROR')
+        # Releasing can close the port outright if this was the last thing holding it,
+        # which is the point: a failed start leaves nothing behind.
+        self._release_bus(bus, logger.id)
+
+    # A bus setpoint reply is funnelled into exactly the same result path a one-shot
+    # subprocess takes, so the dock, the event log and the interlock cannot end up
+    # treating the two transports differently.
+    def _on_bus_set_result(self, bus, event):
+        for control in self.setpoints.values():
+            if control.bus_id == bus.id and control.unit_id == event.get('unit_id') and control.sending:
+                detail = event.get('detail', '')
+                ok = bool(event.get('ok'))
+                self._release_bus(bus, f'{control.id}:command')
+                self._on_setpoint_result(control.id, 0 if ok else 1,
+                                         detail if ok else '', '' if ok else detail)
+                return
+
     # Build one logger's group box: LED, port dropdown (from the live serial port
     # list, defaulting to the declared port), interval dropdown, start/stop button,
     # and a hidden error line that appears only on an unexpected exit.
-    def add_logger_group(self, id, label, script, log_filepath, port, interval_options,
-                         default_interval, extra_args=None):
+    def add_logger_group(self, id, label, log_filepath, interval_options, default_interval,
+                         script=None, port=None, extra_args=None, bus_id=None,
+                         unit_id=None, unit_type=None):
+        _check_transport('logger', id, bus_id, self.buses, script, port)
+        if bus_id is not None and (unit_id is None or unit_type is None):
+            raise ValueError(f"logger {id!r}: a bus logger needs unit_id and unit_type "
+                             f"-- they are how the bus knows which instrument to poll")
         logger = LoggerControl(
             id=id, label=label, script=script, log_filepath=log_filepath,
             interval_options=interval_options, default_interval=default_interval, port=port,
             extra_args=[str(a) for a in (extra_args or [])],
+            bus_id=bus_id, unit_id=unit_id, unit_type=unit_type,
         )
 
         box = QtWidgets.QGroupBox(label)
@@ -1207,9 +1653,12 @@ class ControlDock(QtWidgets.QWidget):
         status_row.addStretch(1)
         box_layout.addLayout(status_row)
 
-        port_combo = self._make_port_combo(port)
-        logger.port_combo = port_combo
-        box_layout.addWidget(port_combo)
+        # A bus logger has no port of its own -- the bus owns the port, and a second
+        # dropdown here could only ever disagree with it.
+        if bus_id is None:
+            port_combo = self._make_port_combo(port)
+            logger.port_combo = port_combo
+            box_layout.addWidget(port_combo)
 
         interval_combo = QtWidgets.QComboBox()
         default_index = 0
@@ -1235,6 +1684,7 @@ class ControlDock(QtWidgets.QWidget):
         logger.start_stop_button = start_stop_button
         box_layout.addWidget(start_stop_button)
 
+        logger.box = box
         self.loggers[id] = logger
         self._set_led(logger, 'stopped')
         self.loggers_layout.addWidget(box)
@@ -1260,6 +1710,9 @@ class ControlDock(QtWidgets.QWidget):
 
     def _start_logger(self, logger):
         interval = logger.pending_interval if logger.pending_interval is not None else logger.interval_combo.currentData()
+        if logger.bus_id is not None:
+            self._start_bus_logger(logger, interval)
+            return
         port = logger.port_combo.currentText()
         # argv is a real list -- never a shell string -- so filenames/ports with
         # spaces need no special handling, and sys.executable ensures the venv
@@ -1283,12 +1736,48 @@ class ControlDock(QtWidgets.QWidget):
         thread.start()
 
         logger.running = True
+        logger.faulted = False
         logger.start_stop_button.setText(f'Stop {logger.label}')
         logger.start_stop_button.setStyleSheet("background-color: red;")
         logger.error_label.hide()
         self._set_led(logger, 'running')
         extras = f", {' '.join(logger.extra_args)}" if logger.extra_args else ''
         self.plotter.log(f"Started logger: {logger.label} ({port}{extras}, {interval}s)", level='INFO')
+
+    # A bus logger has no subprocess of its own: it acquires the shared port and
+    # becomes one polled unit on it. Everything the operator sees -- LED, button,
+    # event log -- is identical to a standalone logger's, because from the dock's
+    # point of view the only difference is what carries the readings.
+    def _start_bus_logger(self, logger, interval):
+        bus = self.buses[logger.bus_id]
+        if not self._acquire_bus(bus, logger.id):
+            logger.error_label.setText('could not open the shared port')
+            logger.error_label.show()
+            self._set_led(logger, 'crashed')
+            return
+        sent = self._send_bus(bus, {
+            'cmd': 'poll', 'unit_id': logger.unit_id, 'unit_type': logger.unit_type,
+            'interval_s': interval, 'log_filepath': logger.log_filepath,
+        })
+        if not sent:
+            self._release_bus(bus, logger.id)
+            logger.error_label.setText('the shared port did not accept the command')
+            logger.error_label.show()
+            self._set_led(logger, 'crashed')
+            return
+
+        logger.user_stopped = False
+        logger.pending_interval = None
+        logger.poll_errors = 0
+        logger.last_poll_error = ''
+        logger.faulted = False
+        logger.running = True
+        logger.start_stop_button.setText(f'Stop {logger.label}')
+        logger.start_stop_button.setStyleSheet("background-color: red;")
+        logger.error_label.hide()
+        self._set_led(logger, 'running')
+        self.plotter.log(f"Started logger: {logger.label} "
+                         f"({bus.port_combo.currentText()}, unit {logger.unit_id}, {interval}s)", level='INFO')
 
     def _read_stderr(self, logger):
         # Runs on a background thread -- must not touch Qt widgets or self.plotter
@@ -1312,8 +1801,14 @@ class ControlDock(QtWidgets.QWidget):
 
     def _stop_logger(self, logger):
         logger.user_stopped = True
-        self._kill(logger.process)
+        if logger.bus_id is not None:
+            bus = self.buses[logger.bus_id]
+            self._send_bus(bus, {'cmd': 'stop', 'unit_id': logger.unit_id})
+            self._release_bus(bus, logger.id)
+        else:
+            self._kill(logger.process)
         logger.running = False
+        logger.faulted = False
         logger.start_stop_button.setText(f'Start {logger.label}')
         logger.start_stop_button.setStyleSheet("background-color: green;")
         self._set_led(logger, 'stopped')
@@ -1330,7 +1825,12 @@ class ControlDock(QtWidgets.QWidget):
     # Never silently flip a crashed logger's button back to "everything is fine" --
     # an unexpected exit gets a red LED and the last captured stderr line.
     def _poll_loggers(self):
+        for bus in self.buses.values():
+            if bus.process is not None and bus.process.poll() is not None and not bus.user_stopped:
+                self._on_bus_died(bus)
         for logger in self.loggers.values():
+            if logger.bus_id is not None:
+                continue  # its health is the bus's health -- see _on_bus_died
             if logger.running and logger.process is not None and logger.process.poll() is not None:
                 exit_code = logger.process.returncode
                 logger.running = False
@@ -1339,6 +1839,7 @@ class ControlDock(QtWidgets.QWidget):
                 if logger.user_stopped:
                     self._set_led(logger, 'stopped')
                 else:
+                    logger.faulted = True
                     self._set_led(logger, 'crashed')
                     last_line = logger.stderr_lines[-1] if logger.stderr_lines else '(no stderr captured)'
                     logger.error_label.setText(f'exit code {exit_code}: {last_line}')
@@ -1349,12 +1850,13 @@ class ControlDock(QtWidgets.QWidget):
     # box in the controller's engineering units, and a Set button. There is no
     # start/stop and no interval: a setpoint is one command, not a process. The LED
     # reports the last command's outcome rather than a running/stopped state.
-    def add_setpoint_group(self, id, label, script, unit_id, port, units,
-                           min_value, max_value, decimals, default_value, confirm):
+    def add_setpoint_group(self, id, label, unit_id, units, min_value, max_value,
+                           decimals, default_value, confirm, script=None, port=None, bus_id=None):
+        _check_transport('setpoint control', id, bus_id, self.buses, script, port)
         control = SetpointControl(
             id=id, label=label, script=script, unit_id=unit_id, port=port, units=units,
             min_value=min_value, max_value=max_value, decimals=decimals,
-            default_value=default_value, confirm=confirm,
+            default_value=default_value, confirm=confirm, bus_id=bus_id,
         )
 
         box = QtWidgets.QGroupBox(f'{label} Setpoint')
@@ -1370,9 +1872,12 @@ class ControlDock(QtWidgets.QWidget):
         status_row.addStretch(1)
         box_layout.addLayout(status_row)
 
-        port_combo = self._make_port_combo(port)
-        control.port_combo = port_combo
-        box_layout.addWidget(port_combo)
+        # As with a bus logger: the bus owns the port, so there is no second dropdown
+        # here that could disagree with it.
+        if bus_id is None:
+            port_combo = self._make_port_combo(port)
+            control.port_combo = port_combo
+            box_layout.addWidget(port_combo)
 
         value_row = QtWidgets.QHBoxLayout()
         # A spin box with a hard range, not a free-text field: the controller accepts
@@ -1404,6 +1909,7 @@ class ControlDock(QtWidgets.QWidget):
         control.send_button = send_button
         box_layout.addWidget(send_button)
 
+        control.box = box
         self.setpoints[id] = control
         self._set_led(control, 'stopped')
         self.setpoints_layout.addWidget(box)
@@ -1428,7 +1934,7 @@ class ControlDock(QtWidgets.QWidget):
             return
 
         value = control.value_spinbox.value()
-        port = control.port_combo.currentText()
+        port = self._control_port(control)
 
         # Unlike starting a logger, this moves gas. Confirming names the value, the
         # units, the port and the unit id, so the operator is checking the actual
@@ -1450,13 +1956,21 @@ class ControlDock(QtWidgets.QWidget):
     # interlock's safe-value command; `source` is what the result handler uses to
     # tell them apart. Returns False if the port is already busy, which is the
     # interlock's cue to try again on its next tick rather than to give up.
+    # Where this control's commands actually go -- its own dropdown, or the bus's.
+    def _control_port(self, control):
+        if control.bus_id is not None:
+            return self.buses[control.bus_id].port_combo.currentText()
+        return control.port_combo.currentText()
+
     def _dispatch_setpoint(self, control, value, source):
         if control.sending:
             return False
 
-        port = control.port_combo.currentText()
+        port = self._control_port(control)
+        if control.bus_id is not None:
+            return self._dispatch_setpoint_over_bus(control, value, source, port)
         # Same argv discipline as a logger (a real list, sys.executable), but a
-        # different argument order -- alicat_MFC_control.py takes
+        # different argument order -- an Alicat control script takes
         # <serial_port> <unit_id> <setpoint>, with no log file and no interval.
         argv = [sys.executable, control.script, port, control.unit_id, f'{value:g}']
 
@@ -1474,6 +1988,53 @@ class ControlDock(QtWidgets.QWidget):
         thread = threading.Thread(target=self._run_setpoint, args=(control.id, argv), daemon=True)
         thread.start()
         return True
+
+    # A setpoint over a shared bus holds the port only for as long as the command is
+    # in flight, so a Set pressed with no logger running still opens the port, sends,
+    # and closes it again -- and one pressed while a logger is running just rides the
+    # connection that logger already holds.
+    def _dispatch_setpoint_over_bus(self, control, value, source, port):
+        bus = self.buses[control.bus_id]
+        user = f'{control.id}:command'
+        if not self._acquire_bus(bus, user):
+            self._on_setpoint_result(control.id, 1, '', f'could not open {port}')
+            return False
+        if not self._send_bus(bus, {'cmd': 'set', 'unit_id': control.unit_id, 'value': value}):
+            self._release_bus(bus, user)
+            self._on_setpoint_result(control.id, 1, '', f'{port} did not accept the command')
+            return False
+
+        control.sending = True
+        control.last_sent_value = value
+        control.command_source = source
+        control.command_token += 1
+        control.send_button.setEnabled(False)
+        control.send_button.setText('Sending...')
+        control.status_label.hide()
+        self._set_led(control, 'sending')
+        via = '' if source == 'operator' else f' [{source}]'
+        self.plotter.log(f"[{control.label}] sending setpoint {value:g} {control.units} "
+                         f"({port}, unit {control.unit_id}){via}", level='INFO')
+
+        # A one-shot subprocess is bounded by subprocess.run's own timeout; a bus
+        # command is not, so it needs one here. Without it a bus that never answers
+        # would leave the button disabled forever -- and a tripped interlock waiting
+        # on a reply that never comes would never retry.
+        QtCore.QTimer.singleShot(
+            int(SETPOINT_TIMEOUT_S * 1000),
+            lambda cid=control.id, token=control.command_token: self._bus_setpoint_timeout(cid, token))
+        return True
+
+    def _bus_setpoint_timeout(self, control_id, token):
+        control = self.setpoints.get(control_id)
+        # The token guards against a timeout for an earlier command firing on a later
+        # one that has since taken its place.
+        if control is None or not control.sending or control.command_token != token:
+            return
+        bus = self.buses.get(control.bus_id)
+        if bus is not None:
+            self._release_bus(bus, f'{control.id}:command')
+        self._on_setpoint_result(control_id, -1, '', f'no reply within {SETPOINT_TIMEOUT_S}s')
 
     def _run_setpoint(self, setpoint_id, argv):
         # Runs on a background thread -- must not touch Qt widgets or self.plotter
@@ -1588,12 +2149,13 @@ class ControlDock(QtWidgets.QWidget):
         box_layout.addWidget(status_label)
 
         reset_button = QtWidgets.QPushButton('Reset Interlock')
-        reset_button.setToolTip('Re-enables the setpoint control. Allowed only once every '
-                                'trigger channel is reading OK again.')
+        reset_button.setToolTip('Re-enables the setpoint control. Allowed only once the '
+                                'vessel pressure is readable again.')
         reset_button.clicked.connect(lambda _, iid=id: self._reset_interlock(iid))
         interlock.reset_button = reset_button
         box_layout.addWidget(reset_button)
 
+        interlock.box = box
         self.interlocks[id] = interlock
         self._refresh_interlock(interlock)
         self.interlocks_layout.addWidget(box)
@@ -1618,9 +2180,9 @@ class ControlDock(QtWidgets.QWidget):
                     self._trip_interlock(interlock, transition.message)
                     break
 
-    # Arms on the first tick where every trigger channel reads OK. That is the same
-    # predicate a reset uses -- "every trigger channel is confirmed good" is exactly
-    # what makes it safe both to start guarding and to let flow resume.
+    # Arms on the first tick where the vessel's pressure is readable. That is the same
+    # predicate a reset uses -- "the pressure is knowable right now" is exactly what
+    # makes it safe both to start guarding and to let flow resume.
     def _update_armed(self, interlock):
         if interlock.armed or self._blocking_channels(interlock):
             return
@@ -1705,10 +2267,9 @@ class ControlDock(QtWidgets.QWidget):
                 self._attempt_interlock_command(interlock)
             self._refresh_interlock(interlock)
 
-    # A reset is allowed only once every trigger channel is reading OK again -- not
-    # merely "not in alarm". STALE and NO_DATA both mean the vessel's pressure is
-    # currently unknown, and re-opening gas on an unknown pressure is the thing this
-    # interlock exists to prevent.
+    # A reset is allowed once the vessel's pressure is readable again -- see
+    # interlock_reset_blockers for exactly what that means, and why a switched-off
+    # gauge must not count against it.
     def _blocking_channels(self, interlock):
         states = {channel_id: self.plotter.alarm_evaluator.state_for(channel_id)
                   for channel_id in interlock.trigger_channel_ids}
@@ -1755,7 +2316,7 @@ class ControlDock(QtWidgets.QWidget):
             self._set_led(interlock, 'stopped')
             interlock.status_label.setStyleSheet('color: #7f8c8d; font-size: 10px;')
             interlock.status_label.setText(f'Not armed — waiting for good data ({waiting}). '
-                                           f'Arms automatically once every channel reads OK.')
+                                           f'Arms automatically once a trigger channel reads OK.')
             interlock.reset_button.setEnabled(False)
             return
         if not interlock.tripped:
@@ -1790,16 +2351,49 @@ class ControlDock(QtWidgets.QWidget):
         interlock.reset_button.setEnabled(not blocking)
         if blocking:
             interlock.reset_button.setToolTip(
-                'Reset blocked until every trigger channel reads OK: '
+                'Reset blocked until the vessel pressure is readable again: '
                 + ', '.join(f'{label} is {state}' for label, state in blocking))
         else:
             interlock.reset_button.setToolTip('Re-enables the setpoint control. The setpoint itself '
                                               'stays at the safe value until you set a new one.')
 
+    # A bus dying takes every control on it down at once, and each has to say so --
+    # a logger silently showing "running" against a closed port is the failure this
+    # whole class exists to make impossible.
+    def _on_bus_died(self, bus):
+        exit_code = bus.process.returncode
+        last_line = bus.stderr_lines[-1] if bus.stderr_lines else '(no stderr captured)'
+        bus.user_stopped = True
+        bus.ready = False
+        bus.users.clear()
+        self.plotter.log(f"[{bus.label}] bus exited unexpectedly (code {exit_code}): {last_line}",
+                         level='ERROR')
+
+        for logger in self.loggers.values():
+            if logger.bus_id == bus.id and logger.running:
+                logger.running = False
+                logger.faulted = True
+                logger.start_stop_button.setText(f'Start {logger.label}')
+                logger.start_stop_button.setStyleSheet("background-color: green;")
+                self._set_led(logger, 'crashed')
+                logger.error_label.setText(f'shared port closed (exit {exit_code}): {last_line}')
+                logger.error_label.show()
+
+        # An in-flight setpoint on a dead bus will never be answered; fail it now so
+        # the control is usable again and a tripped interlock can retry.
+        for control in self.setpoints.values():
+            if control.bus_id == bus.id and control.sending:
+                self._on_setpoint_result(control.id, 1, '', f'shared port closed: {last_line}')
+
+        self._refresh_bus(bus)
+
     def cleanup(self):
+        for bus in self.buses.values():
+            self._stop_bus(bus)
         for logger in self.loggers.values():
             logger.user_stopped = True
-            self._kill(logger.process)
+            if logger.bus_id is None:
+                self._kill(logger.process)
         # In-flight setpoint commands are deliberately NOT killed: they are bounded by
         # SETPOINT_TIMEOUT_S and killing one mid-write could leave the controller at a
         # value nobody asked for. Letting it finish is the safe end state.

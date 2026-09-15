@@ -12,7 +12,7 @@ def create_Alicat_log_csv(filepath, unitType):
     if unitType == "MFC":
         headers = ['Time', 'abs_pressure_Torr', 'temperature_C', "volumetric_flow_LPM", "mass_flow_SLPM", "mass_flow_setpoint_SLPM", "gas_type"]
     elif unitType == "Sensor Only":
-        headers = ['Time', 'abs_pressure_Torr', 'temperature_C', "volumetric_flow_LPM", "mass_flow_SLPM"]
+        headers = ['Time', 'abs_pressure_Torr', 'temperature_C', "volumetric_flow_LPM", "mass_flow_SLPM", "gas_type"]
     else:
         raise(NameError("Valid unit types are: MFC, Sensor Only"))
     if not os.path.exists(filepath):  # Check if the file already exists

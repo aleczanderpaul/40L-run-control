@@ -80,12 +80,37 @@ class TestResetBlockers:
         blockers = interlock_reset_blockers({c: state(last_timestamp=None) for c in TRIGGERS})
         assert [c for c, _ in blockers] == TRIGGERS
 
-    # Not merely "not in ALARM": an unknown pressure blocks a reset just as a high
-    # one does, because gas must not be reopened on a reading nobody can see.
-    @pytest.mark.parametrize('alarm_state', [AlarmState.ALARM, AlarmState.STALE, AlarmState.NO_DATA])
-    def test_any_non_ok_state_blocks(self, alarm_state):
+    # Not merely "not in ALARM": readings that have stopped arriving block a reset
+    # just as a high reading does, because gas must not be reopened on a pressure
+    # nobody can see.
+    @pytest.mark.parametrize('alarm_state', [AlarmState.ALARM, AlarmState.STALE])
+    def test_alarm_and_stale_block(self, alarm_state):
         blockers = interlock_reset_blockers({'ov_pressure_g1': state(alarm_state), 'ov_pressure_g2': state()})
         assert blockers == [('ov_pressure_g1', alarm_state.value)]
+
+    # The 40L's low-range OV gauge is switched off above ~1 Torr, which reads as
+    # NO_DATA. Counting that as a blocker meant the interlock could never arm during
+    # normal operation and would not have tripped at 765 Torr -- the safety feature
+    # silently inert exactly when it was needed. A deliberately-off gauge is not a
+    # fault, which is why the trip rule ignores NO_DATA too.
+    def test_switched_off_gauge_does_not_block_while_another_reads(self):
+        assert interlock_reset_blockers({
+            'ov_pressure_g1': state(),                       # high-range gauge, reading
+            'ov_pressure_g2': state(AlarmState.NO_DATA),     # low-range gauge, switched off
+        }) == []
+
+    # ...but arming with no usable gauge at all must never happen.
+    def test_all_channels_off_blocks(self):
+        blockers = interlock_reset_blockers({c: state(AlarmState.NO_DATA) for c in TRIGGERS})
+        assert [c for c, _ in blockers] == TRIGGERS
+
+    # An off gauge alongside one that is stale is still no usable reading.
+    def test_off_gauge_plus_stale_gauge_blocks_both(self):
+        blockers = interlock_reset_blockers({
+            'ov_pressure_g1': state(AlarmState.STALE),
+            'ov_pressure_g2': state(AlarmState.NO_DATA),
+        })
+        assert blockers == [('ov_pressure_g1', 'STALE'), ('ov_pressure_g2', 'NO_DATA')]
 
     def test_reports_every_blocking_channel(self):
         blockers = interlock_reset_blockers({

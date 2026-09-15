@@ -66,15 +66,22 @@ class AggregateTile:
 class LoggerControl:
     id: str
     label: str
-    script: str
     log_filepath: str
     interval_options: list  # [(option_label, seconds), ...]
     default_interval: float
-    port: str
+    # Both None for a bus logger: the bus owns the port and does the talking, so this
+    # control has no script to launch and no port of its own.
+    script: str | None = None
+    port: str | None = None
     # Extra positional arguments this script needs between the port and the interval
     # (e.g. an Alicat's unit id and unit type). Empty for a script that takes the
     # standard <log_filepath> <port> <interval>.
     extra_args: list = field(default_factory=list)
+    # When set, this logger has no subprocess of its own: it runs as a polled unit on
+    # that shared SerialBus, which owns the port. unit_id/unit_type identify it there.
+    bus_id: str | None = None
+    unit_id: str | None = None
+    unit_type: str | None = None
 
     # Runtime state, populated by ControlDock.add_logger_group() and mutated as it runs.
     process: object = None
@@ -82,7 +89,17 @@ class LoggerControl:
     running: bool = False
     user_stopped: bool = True
     pending_interval: float | None = None
+    # Consecutive rejected frames for this unit on a shared bus. A single bad frame is
+    # a transient the next poll usually clears, so this debounces before the control
+    # goes red -- the same reasoning as AlarmSpec.consecutive_samples.
+    poll_errors: int = 0
+    last_poll_error: str = ''
+    # Set when this control has stopped because something went wrong, cleared when it
+    # is started or stopped deliberately. The dock scrolls, so a red LED can be off
+    # screen -- this is what the pinned fault summary counts.
+    faulted: bool = False
 
+    box: object = None  # this control's group box, so the fault summary can scroll to it
     port_combo: object = None
     interval_combo: object = None
     start_stop_button: object = None
@@ -92,21 +109,23 @@ class LoggerControl:
 
 @dataclass
 class SetpointControl:
-    '''One Alicat MFC setpoint control. Unlike a LoggerControl, whose subprocess is a
-    long-running logger the dock starts and stops, this fires a short one-shot
-    subprocess per Set press -- there is nothing to stop, so there's no start/stop
-    button and no running/crashed lifecycle, only the outcome of the last command.'''
+    '''One Alicat MFC setpoint control. Unlike a LoggerControl, which the dock starts
+    and stops, this sends one command per Set press -- over a shared bus, or as a
+    short one-shot subprocess of its own. Either way there is nothing to stop, so
+    there's no start/stop button and no running/crashed lifecycle, only the outcome of
+    the last command.'''
     id: str
     label: str
-    script: str
     unit_id: str
-    port: str
     units: str
     min_value: float
     max_value: float
     decimals: int
     default_value: float
     confirm: bool
+    # Both None for a bus control, for the same reason as LoggerControl above.
+    script: str | None = None
+    port: str | None = None
 
     # Runtime state, populated by ControlDock.add_setpoint_group() and mutated as
     # commands are sent. `sending` guards against a second command being fired while
@@ -120,7 +139,14 @@ class SetpointControl:
     # Set to a tripped interlock's id while that interlock latches this control. A
     # locked control refuses every operator command until the interlock is reset.
     locked_by: str | None = None
+    # When set, commands go to that shared SerialBus instead of spawning a one-shot
+    # subprocess -- required whenever something else may be holding the same port.
+    bus_id: str | None = None
+    # Bumped on every dispatch so a timeout fired for one command can never act on a
+    # later one that has since taken its place.
+    command_token: int = 0
 
+    box: object = None  # this control's group box, so the fault summary can scroll to it
     port_combo: object = None
     value_spinbox: object = None
     send_button: object = None
@@ -168,6 +194,45 @@ class Interlock:
     next_attempt_time: float | None = None
     gave_up: bool = False
 
+    box: object = None  # this control's group box, so the fault summary can scroll to it
     led: object = None
     status_label: object = None
     reset_button: object = None
+
+
+@dataclass
+class SerialBus:
+    """One serial port shared by several controls, owned by one subprocess.
+
+    Several Alicat units can sit on a single RS-485 adapter, and a serial port has
+    exactly one owner -- so a logger process per unit plus a one-shot setpoint process
+    cannot coexist: whichever opens first locks the others out. A bus replaces them
+    with one process that holds the port and serves every control attached to it.
+
+    `users` is what keeps the port open exactly as long as something needs it: each
+    running logger holds a reference for as long as it runs, and each setpoint command
+    holds one for as long as it is in flight. The process is started when the set goes
+    from empty to non-empty and shut down when it goes back to empty -- so the port
+    opens on the first control used and closes when the last one is done with it.
+    """
+    id: str
+    label: str
+    script: str
+    port: str
+
+    # Runtime state, populated by ControlDock.add_serial_bus_group().
+    process: object = None
+    users: set = field(default_factory=set)
+    ready: bool = False
+    # Why the port is currently unusable, or None while it is fine. The bus PROCESS
+    # starting successfully says nothing about the PORT -- it is opened lazily on the
+    # first poll -- so without this the panel showed green LEDs for a port that could
+    # never be opened, with the only evidence buried in the event log.
+    port_fault: str | None = None
+    stderr_lines: list = field(default_factory=list)
+    user_stopped: bool = True
+
+    box: object = None  # this control's group box, so the fault summary can scroll to it
+    led: object = None
+    port_combo: object = None
+    status_label: object = None

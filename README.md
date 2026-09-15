@@ -16,6 +16,7 @@ python launch_GUI.py
 - `launch_GUI.py` is the *design* — the only file a scientist needs to touch to add a channel, plot, alarm limit, logger, or status-strip tile. It's declarative: register channels, then plots/tabs that reference them by id.
 - `core_tools/alarms.py` is the alarm state machine. It's pure Python (no Qt) so it can be unit-tested and, later, run headless.
 - Data logging runs in **separate subprocesses** that write plain CSV/DAT files; the GUI only ever reads those files. This is deliberate — logs survive a GUI crash and stay usable for offline analysis. Never move logging into the GUI process.
+- Instruments sharing one serial adapter are served by a single bus subprocess that owns the port (`core_tools/AlicatTools/alicat_bus_server_functions.py`), opened on first use and closed on last. See "Shared serial buses" below.
 - Safety interlocks (over-pressure shuts the gas inlet MFC) ride the alarm state machine's transitions rather than re-testing values, so a limit is declared exactly once. See "Safety interlocks" below.
 - `core_tools/notes.py` is the operator-notes store. Pure Python (no Qt), same reasoning as `alarms.py`.
 - A single scan timer on `LivePlotter` (default 1s) reads every registered channel's file on a background thread, evaluates alarms, and pushes fresh data into every unpaused plot. There's no per-plot timer — pausing a plot only stops its own curve redraw; the channel keeps being evaluated for alarms regardless.
@@ -98,7 +99,46 @@ gas_tab.add_logger_control(
 )
 ```
 
-Builds a group box (LED, port dropdown from `serial.tools.list_ports`, interval dropdown, Start/Stop) in the shared control dock. The port dropdown always offers the declared port even when it isn't currently enumerated, so a device that's unplugged or off at launch doesn't become unselectable once it's back. The subprocess is launched as `[sys.executable, script, log_filepath, port, str(interval)]` — a real argv list, never a shell string, so filenames and ports can contain spaces. An unexpected exit turns the LED red and shows the last stderr line; it never silently flips back to "running". Changing the interval while a logger is running is stashed and applied on the next start.
+Builds a group box (LED, port dropdown from `serial.tools.list_ports`, interval dropdown, Start/Stop) in the shared control dock. Pass `bus=` instead of relying on `port=` when something else may hold the same port — see "Shared serial buses" below; a bus logger has no port dropdown and no subprocess of its own. `extra_args` supplies any positional arguments a standalone script needs between the port and the interval. The port dropdown always offers the declared port even when it isn't currently enumerated, so a device that's unplugged or off at launch doesn't become unselectable once it's back. The subprocess is launched as `[sys.executable, script, log_filepath, port, str(interval)]` — a real argv list, never a shell string, so filenames and ports can contain spaces. An unexpected exit turns the LED red and shows the last stderr line; it never silently flips back to "running". Changing the interval while a logger is running is stashed and applied on the next start.
+
+### Shared serial buses
+
+Several instruments can sit on one RS-485 adapter, told apart only by unit id — and a serial port has exactly one owner. A logger subprocess per unit plus a one-shot setpoint subprocess therefore cannot coexist on that port: whichever opens first locks the others out with `Access is denied`. A **bus** replaces them with one process that holds the port and serves every control attached to it.
+
+```python
+plotter.add_serial_bus(id='alicat_bus', label='Alicat Bus',
+                       script='alicat_bus_server.py', port='COM4')
+```
+
+Then attach controls to it instead of giving them their own port:
+
+```python
+gas_tab.add_logger_control(id='log_gas_inlet_alicat', label='Gas Inlet Alicat',
+                            bus='alicat_bus', unit_id='A', unit_type='MFC', ...)
+gas_tab.add_setpoint_control(id='setpoint_gas_inlet_mfc', bus='alicat_bus', unit_id='A', ...)
+```
+
+Declare the bus **before** them; each control validates the reference and raises on a bad one. The dock lays buses and logger controls out in declaration order, so declaring a bus immediately above the controls that attach to it puts its box next to the state it explains — grouping by widget type instead leaves unrelated instruments sitting between a bus and the controls it serves.
+
+A control talks over a bus **or** over its own subprocess, never both and never neither: `bus=` and `script=`/`port=` are mutually exclusive, and omitting all of them raises. Accepting a bus alongside a script used to silently ignore the script, which left arguments in `launch_GUI.py` that read as load-bearing and weren't — the sort of thing someone later "fixes" by editing a file nothing runs. A bus logger also needs `unit_id` and `unit_type`, since that's how the bus knows which instrument to poll.
+
+**The port opens on first use and closes on last.** The bus keeps a set of users: a running logger holds a reference for as long as it runs, and a setpoint command holds one for as long as it's in flight. The process starts when that set goes from empty to non-empty and is shut down when it goes back to empty. So pressing Set with no logger running opens the port, sends, and closes it again; pressing Set while a logger runs just rides the connection that logger already holds. Nothing has to be started or stopped by hand, and nothing is left holding a port it doesn't need.
+
+The port dropdown lives on the bus, not on the controls — there is one physical port, and three copies of the dropdown could only ever disagree. It's disabled while anything holds the port open, since changing it under a running bus would silently leave every attached control talking to the old one.
+
+**The bus process** (`alicat_bus_server.py`, logic in `core_tools/AlicatTools/alicat_bus_server_functions.py`) polls each registered unit on its own interval, appends to that unit's CSV, and executes setpoints between polls. Logging still happens in a subprocess writing plain CSV — this changes how many processes share a port, not where logging lives. The protocol is JSON, one object per line on stdin/stdout, because unit types and filepaths contain spaces and a space-delimited protocol would need quoting rules nobody would get right. The serial port is touched only from the server's main loop; stdin is read on a worker thread through a queue, because `select()` doesn't work on pipes on Windows.
+
+Two guards the per-unit scripts couldn't have: a polled frame is written only if field 0 — the echoed unit id — matches the unit that was asked, and only if the field count matches that unit type. On a shared bus, a reply from the wrong unit or a stale frame left by an earlier timeout would otherwise file one instrument's readings under another's name. A rejected frame is skipped, logged, and retried on the next poll rather than written.
+
+**A bus process starting successfully says nothing about the port.** The port is opened lazily on the first poll, so a bus whose port is unavailable used to start cleanly, report `ready`, and leave every control showing a green LED while the only evidence was `poll_error` lines in the Event Terminal. The server therefore reports port-level failures (`port_error` / `port_ok`) separately from frame-level ones.
+
+A fault **ends** the affected controls exactly the way an unexpected subprocess exit ends a standalone logger: red LED, the reason inline on the group box, and the button back to `Start`. A control that is red but still offering `Stop` is the half-state that made a broken bus look like a working one — a control either is running or it is not, and the button has to say which. Stopping also releases the bus, so a failed start leaves nothing behind: the port closes and the operator presses Start again once they've fixed whatever held it. The bus box keeps showing `CANNOT OPEN COM4 — …` after that, since a placid "Closed" next to two red controls would hide the reason they went red.
+
+Frame-level errors are debounced: a mis-addressed or short frame is usually transient and the next poll clears it, so a unit's control faults only after `BUS_POLL_ERRORS_BEFORE_FAULT` (3) consecutive bad frames — the same reasoning as `AlarmSpec.consecutive_samples` — and a good frame resets the count. A unit answering with the wrong id faults that unit's control while the bus stays healthy, which is accurate: the port is fine, that instrument isn't.
+
+**When the bus dies,** every control on it is told at once: each running logger goes red with the exit code and last stderr line, and an in-flight setpoint is failed immediately rather than waiting — so a tripped interlock can retry instead of hanging on a reply that will never come. A bus setpoint also carries its own `SETPOINT_TIMEOUT_S` deadline (a one-shot subprocess gets that from `subprocess.run`; a bus command has nothing equivalent), with a token so a timeout fired for one command can never act on a later one.
+
+A bus setpoint's reply is funnelled into the same result path a one-shot subprocess takes, so the dock, the event log and the interlock can't end up treating the two transports differently.
 
 ### MFC setpoint controls
 
@@ -106,9 +146,8 @@ Builds a group box (LED, port dropdown from `serial.tools.list_ports`, interval 
 gas_tab.add_setpoint_control(
     id='setpoint_gas_inlet_mfc',
     label='Gas Inlet MFC',
-    script='alicat_MFC_control.py',
+    bus='alicat_bus',                # or script=/port= for a unit alone on its own adapter
     unit_id='A',                     # RS-485 address the command is sent to
-    port='COM4',                     # default; overridable from a live port dropdown at runtime
     units='SLPM',
     min_value=0.0,
     max_value=50.0,                  # the controller's configured full scale
@@ -118,17 +157,19 @@ gas_tab.add_setpoint_control(
 )
 ```
 
-Builds a group box in the same control dock as the logger controls (its own block below them): LED, port dropdown, a bounded value box, a Set button, and a one-line result. It is **not** a logger and deliberately doesn't look like one — a setpoint is one command, not a process, so there's no Start/Stop, no interval, and no LED lifecycle to watch. Each press runs `alicat_MFC_control.py` once as `[sys.executable, script, port, unit_id, str(value)]` — note the argument order differs from a logger's `script log_filepath port interval`, because that's the argv the control script takes.
+Builds a group box in the same control dock as the logger controls (its own block below them): LED, a bounded value box, a Set button, and a one-line result. It is **not** a logger and deliberately doesn't look like one — a setpoint is one command, not a process, so there's no Start/Stop, no interval, and no LED lifecycle to watch.
 
-The command runs on a worker thread and reports back through a signal, never on the GUI thread: it opens the serial port, sleeps 1 s for the device, writes and reads, so running it inline would freeze every plot for seconds. While it's in flight the LED is amber and the button is disabled, so a second command can't be fired at the same serial port. `SETPOINT_TIMEOUT_S` (15 s) bounds a controller that never answers.
+On a bus, each press sends one `set` command to the process that owns the port. Standalone (`script=`/`port=`), each press instead runs that script once as `[sys.executable, script, port, unit_id, str(value)]` — note the argument order differs from a logger's `script log_filepath port interval`.
 
-**A zero exit code does not mean the setpoint took.** `alicat_MFC_control.py` prints `ERROR during set setpoint, output: ...` and still exits 0 when the controller's reply isn't a valid data frame — wrong unit id, setpoint source configured for analog instead of Serial/Front Panel, or nothing on the other end of the line. A command counts as acknowledged only when the process exited cleanly *and* the script says the controller acknowledged (`setpoint_acknowledged()`, unit-tested in `tests/test_setpoint_result.py`); anything else gets a red LED, the reply or stderr line shown in the box, and an `ERROR` line in the Event Terminal. Every attempt is logged either way, with the value, units, port and unit id.
+Either way the command is off the GUI thread and reports back through a signal: opening a serial port, waiting for the device, writing and reading would freeze every plot for seconds if done inline. While it's in flight the LED is amber and the button is disabled, so a second command can't be fired at the same port. `SETPOINT_TIMEOUT_S` (15 s) bounds a controller that never answers.
+
+**A zero exit code does not mean the setpoint took.** The control script prints `ERROR during set setpoint, output: ...` and still exits 0 when the controller's reply isn't a valid data frame — wrong unit id, setpoint source configured for analog instead of Serial/Front Panel, or nothing on the other end of the line. A command counts as acknowledged only when the process exited cleanly *and* the script says the controller acknowledged (`setpoint_acknowledged()`, unit-tested in `tests/test_setpoint_result.py`); anything else gets a red LED, the reply or stderr line shown in the box, and an `ERROR` line in the Event Terminal. Every attempt is logged either way, with the value, units, port and unit id.
 
 The value box is a hard-bounded spin box rather than a free-text field — the controller accepts whatever it's sent, so `min_value`/`max_value` declared here are the only thing between a typo and 500 SLPM. `confirm=True` (the default) additionally names the value, units, port and unit id in a dialog before the command goes out; pass `confirm=False` for a control where that's more friction than it's worth.
 
 Nothing about this control reads the setpoint back — that's the logger's job. The resulting setpoint shows up on the `gas_inlet_flow_setpoint` channel like any other reading, which is also how an operator confirms the controller is where they put it.
 
-In-flight setpoint commands are **not** killed on GUI shutdown (running loggers are). They're already bounded by the timeout, and killing one mid-write could leave the controller at a value nobody asked for.
+In-flight one-shot setpoint commands are **not** killed on GUI shutdown (running loggers are). They're already bounded by the timeout, and killing one mid-write could leave the controller at a value nobody asked for.
 
 ### Safety interlocks
 
@@ -151,9 +192,11 @@ Declared on the plotter rather than on a tab — it's a system-wide rule, not pa
 
 `trip_on_stale=True` also trips when the trigger channel stops reporting. A channel that went quiet isn't reading high, but it isn't reading safe either, and gas flowing into a vessel whose pressure nobody is watching is the case this exists to prevent. `NO_DATA` deliberately does **not** trip: the evaluator reaches it on NaN readings, which it treats as a normal intentionally-off gauge.
 
-**Arming.** An interlock starts *disarmed* and arms the first time every trigger channel is confirmed good — reading `OK`, with data actually having arrived. Without this, launching the GUI before the pressure logger is started trips it instantly (the log file still holds the previous run's rows, so the channel goes `STALE` within seconds), firing a doomed MFC command and raising a red banner on every launch. An interlock that cries wolf at startup is one operators learn to ignore, which costs more safety than it buys. Arming is one-way: once a channel has been seen good, losing it later is a real loss of signal and trips. While disarmed the dock says so plainly and locks nothing.
+**Arming.** An interlock starts *disarmed* and arms the first time the quantity it watches is readable — at least one trigger channel reading `OK`, with data actually having arrived. Without this, launching the GUI before the pressure logger is started trips it instantly (the log file still holds the previous run's rows, so the channel goes `STALE` within seconds), firing a doomed MFC command and raising a red banner on every launch. An interlock that cries wolf at startup is one operators learn to ignore, which costs more safety than it buys. Arming is one-way: once a channel has been seen good, losing it later is a real loss of signal and trips. While disarmed the dock says so plainly and locks nothing.
 
-**Latching.** A trip locks the setpoint control: its Set button is disabled (with a tooltip saying why) and the dispatcher refuses commands independently of the widget's enabled flag. **Reset Interlock** unlocks it, and is itself allowed only once every trigger channel is confirmed good again — the same predicate as arming. That's stricter than "the alarm cleared": `STALE` and `NO_DATA` block a reset too, because you can't reopen gas on a pressure nobody can see. Reset does **not** restore the previous setpoint; flow only ever resumes because someone typed a value and pressed Set.
+**Latching.** A trip locks the setpoint control: its Set button is disabled (with a tooltip saying why) and the dispatcher refuses commands independently of the widget's enabled flag. **Reset Interlock** unlocks it, and is itself allowed only once the pressure is readable again — the same predicate as arming. That's stricter than "the alarm cleared": `STALE` blocks a reset too, because you can't reopen gas on readings that have stopped arriving.
+
+A channel in `NO_DATA` does **not** block, as long as another trigger channel is reading. `NO_DATA` is how `alarms.py` represents a deliberately-off gauge (`Off` in the log → NaN), and the 40L's low-range OV gauge is switched off above ~1 Torr. Counting it as a blocker meant the interlock could never arm during normal operation and would not have tripped at 765 Torr — the safety feature silently inert exactly when it was needed. It also contradicted the trip rule, which already ignores `NO_DATA` for the same reason: an intentionally-off gauge isn't a fault, it's just not the gauge in use right now. What must never happen is arming with no usable gauge at all, so when *nothing* is reading `OK`, every non-OK channel blocks, `NO_DATA` included. Reset does **not** restore the previous setpoint; flow only ever resumes because someone typed a value and pressed Set.
 
 **If the safe-value command fails,** it's retried every `INTERLOCK_RETRY_DELAY_S` (2 s) up to `INTERLOCK_MAX_ATTEMPTS` (5) — a safety action that quietly failed is worse than none. Bounded, because against a dead port every attempt fails instantly and an unbounded retry would bury the event log in the one situation where the operator most needs to read it. After the cap the interlock stops commanding and says, in red and in the log, `COULD NOT SET ... SHUT THE GAS MANUALLY`. Until the controller acknowledges, the box stays red and reads *tripped but unconfirmed* — the dangerous state, where the interlock fired and the gas may still be flowing. A trip that lands while an operator's command is still on the port isn't a failure and doesn't spend an attempt; it retries as soon as the port frees up.
 
@@ -175,6 +218,20 @@ plotter.set_status_strip([
 ```
 
 A plain channel id becomes a tile showing its label/value/units. `AggregateTile` reduces (`'max'` or `'min'`) over several channels and shows the worst one's value plus its index. Clicking any tile jumps to that channel's detail plot (or, for an `AggregateTile`, to `jump_to_tab`).
+
+### Control dock layout
+
+The dock's instrument boxes scroll; everything below them is pinned.
+
+Left to itself the dock wanted ~1256px of height with a ~1208px **minimum**, and a Qt layout minimum overrides the maximized window state — so on anything short of a 1440p display it forced the whole window taller than the screen. Only the instrument boxes (buses, loggers, setpoint controls, interlocks) went into the scroll area; the window selector, Pause/Resume, Resume Following and the note input are used constantly and must never scroll away, and at ~194px they are small enough to stay pinned. The dock's minimum height is now 251px, and the window fits 1366x768.
+
+Two columns was the alternative and doesn't work at this width: the dock is only ~320–384px wide at the default splitter ratio, so a fault line like `CANNOT OPEN COM4 — …` wraps to eight or more lines and a *faulted* box ends up taller than a healthy one — content whose height changes with its state, which is the same trap the status strip and alarm banner comments warn about. Making two columns honest would mean roughly doubling the dock's width, which comes out of the plots.
+
+The scroll area keeps its horizontal scrollbar **off**, so the content's minimum *width* still propagates out and the splitter can't collapse the dock narrower than a Start button, while the height — the dimension that was overflowing — is free to scroll.
+
+Each section inside the scroll area is a real widget rather than a bare nested `QVBoxLayout`: a layout added to another layout doesn't reliably push a size change up the chain when a widget is added to it later, so the scroll content reported a height of 0, the scroll area concluded everything fit, and the content was silently clipped with no scrollbar.
+
+**The fault summary** is pinned above the scroll area and hidden whenever nothing is wrong. Once the boxes scroll, a red LED can be off screen — which would undo the point of making failures obvious — so this does for the dock what the alarm banner does for channels: it names every faulted bus, stopped-by-error logger and tripped interlock, and clicking it scrolls the first one into view. It's recomputed from state on the same 500ms tick that polls loggers, rather than maintained incrementally: a dozen call sites setting a flag is a dozen chances to leave the summary claiming all-clear over a red LED.
 
 ### Time window and other global controls
 
