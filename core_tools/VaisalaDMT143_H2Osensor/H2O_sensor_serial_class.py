@@ -27,7 +27,7 @@ class VaisalaDMT143Serial:
 
         time.sleep(2.1)  # Wait 2.1 seconds for the serial port and device to initialize (from Vaisala documentation)
 
-        self.EscapeRunMode #just in case startup mode is RUN
+        self.EscapeRunMode() #just in case startup mode is RUN
     
     def _send_command(self, cmd):
         self.ser.reset_input_buffer()

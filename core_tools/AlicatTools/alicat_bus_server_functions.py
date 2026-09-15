@@ -7,7 +7,7 @@ import threading
 import time
 
 from .Alicat_serial_class import AlicatSerial
-from .save_Alicat_readings_functions import create_Alicat_log_csv
+from .create_Alicat_log import create_Alicat_log_csv
 
 '''One process that owns a single Alicat RS-485 bus.
 
@@ -28,7 +28,8 @@ spaces and a space-delimited protocol would need quoting rules nobody would get 
         {"cmd": "stop", "unit_id": "A"}
         {"cmd": "set",  "unit_id": "A", "value": 12.5}
         {"cmd": "quit"}
-  out:  {"event": "ready"} | {"event": "set_result", ...} | {"event": "polled", ...}
+  out:  {"event": "ready"} | {"event": "set_result", ...}
+        {"event": "polled", "unit_id": "A", "row": [...the CSV row just written...]}
         {"event": "poll_error", ...} | {"event": "port_error", ...} | {"event": "port_ok"}
         {"event": "polling", ...} | {"event": "stopped", ...} | {"event": "error", ...}
 
@@ -82,10 +83,12 @@ class PolledUnit:
         return 7 if self.unit_type == 'MFC' else 6
 
     def write_row(self, parts):
+        row = [time.strftime('%Y-%m-%d %H:%M:%S')] + parts[1:]
         with open(self.log_filepath, 'a', newline='') as fh:
-            csv.writer(fh).writerow([time.strftime('%Y-%m-%d %H:%M:%S')] + parts[1:])
+            csv.writer(fh).writerow(row)
             fh.flush()
             os.fsync(fh.fileno())
+        return row
 
 
 class AlicatBus:
@@ -158,11 +161,14 @@ class AlicatBus:
             emit(event='poll_error', unit_id=unit.unit_id,
                  detail=f'expected {unit.expected_fields()} fields, got {len(parts)}')
             return
-        unit.write_row(parts)
+        row = unit.write_row(parts)
         # Success is reported too, so the GUI can tell a unit that is answering from
         # one that has quietly stopped -- without it, a run of frame errors and a
-        # healthy bus look identical between errors.
-        emit(event='polled', unit_id=unit.unit_id)
+        # healthy bus look identical between errors. The row rides along so the GUI can
+        # echo each reading to the console the way the standalone loggers do; printing
+        # it here instead would either corrupt the protocol (stdout) or turn every
+        # reading into an event-log ERROR line (stderr).
+        emit(event='polled', unit_id=unit.unit_id, row=row)
 
     def set_setpoint(self, unit_id, value):
         connection = self._connection(unit_id)

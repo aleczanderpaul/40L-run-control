@@ -2,7 +2,7 @@ from core_tools.gui.live_plotter_GUI_class import LivePlotter
 from core_tools.gui.models import AggregateTile
 from core_tools.MKSPDR2000_pressure.save_pressure_readings_functions import create_pressure_log_csv
 from core_tools.VaisalaDMT143_H2Osensor.save_H2O_sensor_readings_functions import create_H2O_log_csv
-from core_tools.AlicatTools.save_Alicat_readings_functions import create_Alicat_log_csv
+from core_tools.AlicatTools.create_Alicat_log import create_Alicat_log_csv
 from core_tools.alarms import AlarmSpec
 
 '''Launches run control GUI for the 40L system as specified by the user in this file.'''

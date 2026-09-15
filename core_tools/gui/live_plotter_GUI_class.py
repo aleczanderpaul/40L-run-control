@@ -1526,7 +1526,7 @@ class ControlDock(QtWidgets.QWidget):
         elif kind == 'set_result':
             self._on_bus_set_result(bus, event)
         elif kind == 'polled':
-            self._on_bus_unit_polled(bus, event.get('unit_id'))
+            self._on_bus_unit_polled(bus, event.get('unit_id'), event.get('row'))
         elif kind == 'poll_error':
             # Not fatal -- one dropped or mis-addressed frame is skipped rather than
             # written, and the next poll tries again. Logged so a bus that is dropping
@@ -1563,12 +1563,20 @@ class ControlDock(QtWidgets.QWidget):
         self.plotter.log(f"[{bus.label}] {bus.port_combo.currentText()} recovered", level='INFO')
         self._refresh_bus(bus)
 
-    def _on_bus_unit_polled(self, bus, unit_id):
+    def _on_bus_unit_polled(self, bus, unit_id, row=None):
         logger = self._bus_logger_for(bus, unit_id)
         if logger is None or not logger.running:
             return
         logger.poll_errors = 0
         logger.last_poll_error = ''
+        # Echoed to the console, exactly where log_pressure.py's and
+        # log_H2O_readings.py's own prints end up: those run as subprocesses whose
+        # stdout is inherited, so their output lands in the terminal the GUI was
+        # launched from, not in the Event Terminal. Deliberately NOT the event log --
+        # two units at 2s is a line every second, which would bury alarms and logger
+        # crashes. flush=True because stdout is block-buffered when it isn't a tty.
+        if row:
+            print(f'Alicat {logger.label} (unit {unit_id}): {row}', flush=True)
 
     def _on_bus_unit_poll_error(self, bus, unit_id, detail):
         logger = self._bus_logger_for(bus, unit_id)

@@ -180,8 +180,17 @@ def get_alicat_flowrate(dataframe):
 
     return pd.Series(flowRate, name='Flowrate', index=dataframe.index)
 
-def get_alicat_pressure(dataframe):
-    pressure = pd.to_numeric(dataframe['abs_pressure_Torr'], errors='coerce')
+def get_alicat_pressure(dataframe, loggingUnits):
+    if loggingUnits == 'Torr':
+        pressure = pd.to_numeric(dataframe['abs_pressure_Torr'], errors='coerce')
+    elif loggingUnits == 'PSI':
+        pressure = pd.to_numeric(dataframe['abs_pressure_PSI'], errors='coerce')
+        pressure = pressure * 760 / 14.6959488
+    else:
+        # Without this a typo'd unit falls through to an UnboundLocalError on
+        # `pressure`, which names the wrong thing entirely. Same shape of error
+        # get_n_XY_datapoints raises for an unknown datatype.
+        raise ValueError(f"Unsupported logging units: {loggingUnits}. Valid units are: Torr, PSI.")
 
     return pd.Series(pressure, name='Pressure', index=dataframe.index)
 
@@ -231,10 +240,14 @@ def get_n_XY_datapoints(data_filepath, n, datatype, vmm_num):
         times = get_seconds_ago(dataframe)
         flowrates = get_alicat_flowrate(dataframe)
         return times, flowrates
-    elif datatype == 'filter_line_pressure' or datatype == 'gas_inlet_pressure':
+    elif datatype == 'filter_line_pressure':
         times = get_seconds_ago(dataframe)
-        pressures = get_alicat_pressure(dataframe)
+        pressures = get_alicat_pressure(dataframe, 'PSI')
         return times, pressures
+    elif datatype == 'gas_inlet_pressure':
+            times = get_seconds_ago(dataframe)
+            pressures = get_alicat_pressure(dataframe, 'Torr')
+            return times, pressures
     elif datatype == 'filter_line_temperature' or datatype == 'gas_inlet_temperature':
         times = get_seconds_ago(dataframe)
         temperatures = get_alicat_temperature(dataframe)

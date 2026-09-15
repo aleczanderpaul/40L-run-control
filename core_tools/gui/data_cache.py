@@ -59,8 +59,13 @@ def get_n_xy_cached(cache, filepath, n, datatype, vmm_num, read_n=None):
         return get_seconds_ago(df), get_outer_vessel_gauge_pressure(df, 2)
     elif datatype == 'filter_line_flowrate' or datatype == 'gas_inlet_flowrate':
         return get_seconds_ago(df), get_alicat_flowrate(df)
-    elif datatype == 'filter_line_pressure' or datatype == 'gas_inlet_pressure':
-        return get_seconds_ago(df), get_alicat_pressure(df)
+    # The two Alicats log pressure in different units -- the filter-line meter reports
+    # PSI, the gas-inlet controller Torr -- so each names its own, and get_alicat_pressure
+    # converts to the Torr the channels are declared in.
+    elif datatype == 'filter_line_pressure':
+        return get_seconds_ago(df), get_alicat_pressure(df, 'PSI')
+    elif datatype == 'gas_inlet_pressure':
+        return get_seconds_ago(df), get_alicat_pressure(df, 'Torr')
     elif datatype == 'filter_line_temperature' or datatype == 'gas_inlet_temperature':
         return get_seconds_ago(df), get_alicat_temperature(df)
     elif datatype == 'filter_line_H2O_concentration':

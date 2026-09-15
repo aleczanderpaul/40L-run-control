@@ -40,26 +40,35 @@ class AlicatSerial:
         return parts
 
     def set_flow_setpoint(self, setpoint): #only for Alicat MFC, NOT the sensor only one
-        self.ser.reset_input_buffer()
-        
         """
         Set a new flow setpoint on the controller.
 
         Per the Alicat MPL manual, the command format is:
             <unit_id>S <setpoint_value>\r
         """
+        # The docstring has to come first to be a docstring at all -- with a statement
+        # above it, it is just a string expression nobody can read via help().
+        self.ser.reset_input_buffer()
+
         command = f"{self.unit_id}S {setpoint}\r"
         self.ser.write(command.encode())
 
         response = self.ser.read_until(expected=b'\r').decode(errors="replace").strip()
 
-        # Expected reply is a data frame like: "A +015.44 ..." — the second
+        # The reply is a data frame like "A +015.44 ...". Two things are checked, and
+        # an exact field count is deliberately NOT one of them:
+        #
+        #  * parts[0] must be the unit this object addresses. Several Alicats share one
+        #    RS-485 bus, so a 7-field reply from the WRONG unit would otherwise read as
+        #    a successful setpoint on this one -- and the over-pressure interlock would
+        #    report gas shut when it was still flowing.
+        #  * at least 7 fields, not exactly 7. Some firmware appends a status/alarm
+        #    code, making a perfectly good frame 8 fields. Demanding exactly 7 turned
+        #    every successful command into a reported failure, which for the interlock
+        #    means crying wolf on a safe-value command that actually landed.
         parts = response.split()
-        if len(parts) == 7:
-            try:
-                return f'Successfully set Alicat MFC setpoint, output: {parts}'
-            except ValueError:
-                pass
+        if len(parts) >= 7 and parts[0] == self.unit_id:
+            return f'Successfully set Alicat MFC setpoint, output: {parts}'
         return f'ERROR during set Alicat MFC setpoint, output: {parts}'
 
     def close_port(self):
