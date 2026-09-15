@@ -35,7 +35,8 @@ plotter.add_channel(
     filepath=outer_vessel_pressure_log_filepath,
     datatype='outer_vessel_gauge_1_pressure',   # dispatch key -- see get_data_for_GUI.py
     units='Torr',
-    log_interval_s=2,                # REQUIRED -- drives staleness and the time-window row count
+    log_interval_s=2,                # REQUIRED -- drives staleness and the time-window row count.
+                                     # A DEFAULT: overridden at runtime by the logger's rate (below).
     alarm=AlarmSpec(high=760.0, clear_high=750.0),   # optional
     vmm_num=None,                     # 0-15 for VMM temperature channels only
     overview_group=None,              # heading on the Overview tab, e.g. 'Outer Vessel'
@@ -46,7 +47,7 @@ Supported `datatype` values are the ones dispatched on in `get_n_XY_datapoints()
 
 ### Alarms
 
-`AlarmSpec` (`core_tools/alarms.py`) fields: `high`, `low`, `clear_high`, `clear_low`, `abs_high`, `clear_abs_high` (all optional — set the ones relevant to that channel), `consecutive_samples=3` (debounce), `stale_multiplier=5` (staleness = `stale_multiplier * log_interval_s` seconds without a fresh sample). All thresholds are declared here, in `launch_GUI.py`, only — there's no runtime threshold editing and no separate config file.
+`AlarmSpec` (`core_tools/alarms.py`) fields: `high`, `low`, `clear_high`, `clear_low`, `abs_high`, `clear_abs_high` (all optional — set the ones relevant to that channel), `consecutive_samples=3` (debounce), `stale_multiplier=5` (staleness = `stale_multiplier * log_interval_s` seconds without a fresh sample — and that interval **follows the logger's dropdown at runtime**, see below). All thresholds are declared here, in `launch_GUI.py`, only — there's no runtime threshold editing and no separate config file.
 
 Alarm evaluation always uses each channel's **raw** value, never an offset-adjusted one, so tuning a plot's display offset can't silently move a trip point.
 
@@ -65,6 +66,10 @@ gas_tab.add_plot(
     group='Outer Vessel',            # which QGroupBox on this tab it's wrapped in
 )
 ```
+
+Every curve draws a **dot at each sample** joined by the trend line, so the actual sample positions are visible and not just the shape joining them — which is also what makes an irregular or dropped sample obvious instead of being smoothed into the line.
+
+Dots are shown only while they are far enough apart to read, judged against the plot's real width (`POINT_MARKER_MIN_SPACING_PX`, 3px) rather than a fixed point count: the same 450 points are legible on a maximised plot and a solid smear on a narrow one, and the operator resizes the dock, window and splitters constantly. In the default layout a plot's drawing area is ~580px, so the 1m and 5m windows keep their dots and 15m and longer do not. Past `SYMBOL_MAX_POINTS` they are suppressed regardless — beyond `DECIMATION_CAP` the drawn points are min/max per bucket rather than real samples, so dotting them would be a lie as well as a repaint cost (~0.4ms/curve for a line vs ~10.5ms with 20000 dots, on every plot every scan tick). The VMM overlay follows the same rule; the Overview tab's sparklines deliberately don't, being 40px tall.
 
 Multi-channel plots get a real legend (colors are never encoded in the title). Each channel with an `alarm` gets a dashed threshold line (offset-corrected so it still lines up with the trace) and the plot's border/title turn red while any of its channels is in `ALARM`. How much history is shown is governed by the global time-window selector in the control dock, not a per-plot setting.
 
@@ -100,6 +105,10 @@ gas_tab.add_logger_control(
 ```
 
 Builds a group box (LED, port dropdown from `serial.tools.list_ports`, interval dropdown, Start/Stop) in the shared control dock. Pass `bus=` instead of relying on `port=` when something else may hold the same port — see "Shared serial buses" below; a bus logger has no port dropdown and no subprocess of its own. `extra_args` supplies any positional arguments a standalone script needs between the port and the interval. The port dropdown always offers the declared port even when it isn't currently enumerated, so a device that's unplugged or off at launch doesn't become unselectable once it's back. The subprocess is launched as `[sys.executable, script, log_filepath, port, str(interval)]` — a real argv list, never a shell string, so filenames and ports can contain spaces. An unexpected exit turns the LED red and shows the last stderr line; it never silently flips back to "running". Changing the interval while a logger is running is stashed and applied on the next start.
+
+**Starting a logger writes its rate onto every channel that reads its log file.** A channel's `log_interval_s` drives when the alarm evaluator calls it `STALE` (`stale_multiplier * log_interval_s`) and how many rows a plot fetches for the time window — both claims about how often data *actually* arrives, which is whatever the operator picked from the dropdown, not what `launch_GUI.py` declared. While the two were independent, switching a logger to `1m` left its channels believing `2s`: every reading arrived ~50 s after the channel had already been declared stale, and a "5m" window drew 150 rows of a file producing 5 in five minutes. The same reconciliation runs once at declaration, so a channel declared `log_interval_s=2` alongside a logger declaring `default_interval=10` can't sit quietly disagreeing before the first start.
+
+The logger control is the authority here because it is what writes the file. A logger and a channel never name each other in `launch_GUI.py` — the log file they share is the only link, which is what `channels_fed_by()` walks (unit-tested in `tests/test_log_interval.py`). Channels written by something outside this program — `gauge_pressure`, the VMM temperatures — have no logger control and keep their declared rate.
 
 ### Shared serial buses
 

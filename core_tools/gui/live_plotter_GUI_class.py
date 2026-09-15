@@ -18,7 +18,7 @@ from .decimate import decimate_min_max
 from .data_cache import ScanRunnable
 from .palette import channel_palette
 from core_tools.notes import NoteStore, visible_notes
-from core_tools.alarms import AlarmEvaluator, AlarmState, DisplayStatus, display_status
+from core_tools.alarms import AlarmEvaluator, AlarmSpec, AlarmState, DisplayStatus, display_status
 
 '''Class to handle live plotting and add various controls/buttons in a Qt GUI application.'''
 
@@ -110,6 +110,61 @@ FOLLOW_INDICATOR_WIDTH = 74
 # drawing. Keep it that way -- reading only rows_for_window() rows would silently
 # shorten alarm evaluation's history at short windows, which is the failure the floor
 # exists to prevent.
+# A dot per sample, so the actual sample positions are visible and not just the trend
+# line joining them. Shown only while they are far enough apart to read: a plot is a
+# few hundred pixels wide, so beyond a few hundred points the dots stop being separate
+# marks and become a solid smear that hides the very trace it is drawn on -- and past
+# DECIMATION_CAP they would not even be real samples, since decimation replaces them
+# with min/max per bucket. Above the cap the line alone carries the trend.
+#
+# Cost measured at ~0.4ms per curve for a line vs ~10.5ms with 20000 dots; with every
+# plot redrawing each scan tick, always-on dots would spend a large slice of every
+# second on marks nobody can resolve.
+POINT_MARKER_SIZE = 5
+# Minimum horizontal pixels per dot for the dots to read as separate marks. Judged
+# against the plot's actual width rather than a fixed point count, because the same
+# 450 points are legible on a maximised plot and a solid smear on a narrow one -- and
+# the operator resizes the dock, the window and the tab splitters constantly. At 3px
+# the default 5m window (150 points on a ~580px plot) keeps its dots and 15m does not,
+# which is about where they stop being separable anyway.
+POINT_MARKER_MIN_SPACING_PX = 3
+# Fallback only, for the first redraw before the plot has been laid out and has a
+# width to measure. Also an upper bound: past this, dots are a repaint cost with
+# nothing to show for it whatever the window size.
+SYMBOL_MAX_POINTS = 500
+
+
+def style_point_markers(curve, color):
+    """Configure a curve's dots once, at creation. Size/brush/pen persist across
+    setSymbol(None), so showing and hiding later is a single call."""
+    curve.setSymbolSize(POINT_MARKER_SIZE)
+    curve.setSymbolBrush(color)   # filled, so a dot reads as a dot at 5px
+    curve.setSymbolPen(None)      # no outline -- an outline at this size just muddies it
+    curve.setSymbol(None)         # off until the first update decides
+
+
+def point_marker_budget(curve):
+    """How many points this curve can show dots for, from its width on screen."""
+    view = curve.getViewBox()
+    width = view.width() if view is not None else 0
+    if not width:
+        return SYMBOL_MAX_POINTS  # not laid out yet; the next redraw measures properly
+    return min(int(width / POINT_MARKER_MIN_SPACING_PX), SYMBOL_MAX_POINTS)
+
+
+def set_point_markers(curve, n_points):
+    """Show or hide a curve's dots for the number of points about to be drawn.
+
+    Only touches the curve when the answer changes: setSymbol triggers a repaint, and
+    this runs for every curve on every scan tick.
+    """
+    wanted = 0 < n_points <= point_marker_budget(curve)
+    if getattr(curve, '_markers_on', None) is wanted:
+        return
+    curve._markers_on = wanted
+    curve.setSymbol('o' if wanted else None)
+
+
 def rows_for_window(window_s, log_interval_s):
     return max(2, math.ceil(window_s / log_interval_s))
 
@@ -375,6 +430,18 @@ def interlock_reset_blockers(alarm_states):
     return blockers
 
 
+def channels_fed_by(channels, log_filepath):
+    """Ids of the channels a logger writing `log_filepath` feeds.
+
+    A logger control and a channel are declared independently in launch_GUI.py and
+    never name each other -- the file they share is the only link between them. It is
+    what lets a logger's actual rate reach the channels that depend on it, instead of
+    each side believing whatever it was declared with.
+    """
+    return [channel_id for channel_id, channel in channels.items()
+            if channel.filepath == log_filepath]
+
+
 def _check_transport(kind, control_id, bus_id, buses, script, port):
     """A control talks over a shared bus or over its own subprocess -- never both, and
     never neither.
@@ -627,10 +694,12 @@ class LivePlotter:
                     continue
                 idx = plot.channel_ids.index(channel_id)
                 plot.curves[idx].setData(x=dec_x, y=dec_y + float(plot.offsets[idx]))
+                set_point_markers(plot.curves[idx], len(dec_x))
 
             for tab in self.tab_objects.values():
                 if isinstance(tab, VMMTab) and not tab.paused and channel_id in tab.curves:
                     tab.curves[channel_id].setData(x=dec_x, y=dec_y)
+                    set_point_markers(tab.curves[channel_id], len(dec_x))
 
         # Interlocks act on the same transitions the banner and event log just got,
         # ahead of the visual refresh: if an over-pressure is going to shut the gas,
@@ -925,6 +994,7 @@ class LiveTab(QtWidgets.QWidget):
             channel = self._channel(channel_id)
             color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
             curve = plot_widget.plot(pen=color, name=channel.label if multi_curve else None)
+            style_point_markers(curve, color)
             plot.curves.append(curve)
 
             # Threshold lines are drawn offset-corrected so they still line up
@@ -1694,9 +1764,34 @@ class ControlDock(QtWidgets.QWidget):
 
         logger.box = box
         self.loggers[id] = logger
+        # The logger control is the authority on its channels' rate -- it is what
+        # writes the file. Reconciling here means a launch_GUI.py that declares
+        # log_interval_s=2 on a channel and default_interval=10 on its logger can't
+        # leave the two quietly disagreeing before the first start.
+        self._apply_log_interval(logger, default_interval)
         self._set_led(logger, 'stopped')
         self.loggers_layout.addWidget(box)
         return logger
+
+    # A channel's log_interval_s drives two things: when the alarm evaluator calls it
+    # STALE (stale_multiplier x interval) and how many rows a plot fetches for the
+    # time window. Both are statements about how often data ACTUALLY arrives, so both
+    # have to follow the rate the logger is really running at -- not the one declared
+    # in launch_GUI.py. Without this, switching the dropdown to 1m left the channel
+    # believing 2s, so every reading arrived ~50s after it had already been called
+    # stale, and the plot drew 30x more history than the window claimed.
+    def _apply_log_interval(self, logger, interval):
+        changed = []
+        for channel_id in channels_fed_by(self.plotter.channels, logger.log_filepath):
+            channel = self.plotter.channels[channel_id]
+            if channel.log_interval_s != interval:
+                channel.log_interval_s = interval
+                changed.append(channel.label)
+        if changed:
+            multiplier = AlarmSpec().stale_multiplier
+            self.plotter.log(f"[{logger.label}] now logging every {interval}s -- "
+                             f"{', '.join(changed)} go stale after {multiplier * interval:g}s",
+                             level='INFO')
 
     # Changing the interval while a logger is running must not silently do nothing:
     # stash it and apply on the next start, rather than restarting the process here.
@@ -1745,6 +1840,7 @@ class ControlDock(QtWidgets.QWidget):
 
         logger.running = True
         logger.faulted = False
+        self._apply_log_interval(logger, interval)
         logger.start_stop_button.setText(f'Stop {logger.label}')
         logger.start_stop_button.setStyleSheet("background-color: red;")
         logger.error_label.hide()
@@ -1780,6 +1876,7 @@ class ControlDock(QtWidgets.QWidget):
         logger.last_poll_error = ''
         logger.faulted = False
         logger.running = True
+        self._apply_log_interval(logger, interval)
         logger.start_stop_button.setText(f'Stop {logger.label}')
         logger.start_stop_button.setStyleSheet("background-color: red;")
         logger.error_label.hide()
@@ -2945,6 +3042,7 @@ class VMMTab(QtWidgets.QWidget):
 
         for channel_id in self.channel_ids:
             self.curves[channel_id] = self.overlay_widget.plot(pen=pg.mkPen(self._colors[channel_id], width=1))
+            style_point_markers(self.curves[channel_id], self._colors[channel_id])
 
         outer_layout = QtWidgets.QVBoxLayout()
         outer_layout.addWidget(splitter)
