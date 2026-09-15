@@ -2,6 +2,7 @@ from core_tools.gui.live_plotter_GUI_class import LivePlotter
 from core_tools.gui.models import AggregateTile
 from core_tools.MKSPDR2000_pressure.save_pressure_readings_functions import create_pressure_log_csv
 from core_tools.VaisalaDMT143_H2Osensor.save_H2O_sensor_readings_functions import create_H2O_log_csv
+from core_tools.AlicatTools.save_Alicat_readings_functions import create_Alicat_log_csv
 from core_tools.alarms import AlarmSpec
 
 '''Launches run control GUI for the 40L system as specified by the user in this file.'''
@@ -23,7 +24,6 @@ outer_vessel_pressure_g2_offset = 0
 gauge_pressure_offset = 0
 gas_inlet_flow_offset = 0
 gas_inlet_flow_setpoint_offset = 0
-gas_inlet_valve_drive_offset = 0
 gas_inlet_pressure_offset = 0
 gas_inlet_temperature_offset = 0
 filter_line_gas_flow_offset = 0
@@ -33,13 +33,18 @@ filter_line_H2O_offset = 0
 
 num_vmms = 16
 
-#Gas inlet Alicat MFC -- the setpoint control below commands this unit. max_flow is the
-#controller's configured full scale and is what bounds the GUI's setpoint box, so it has
-#to match the device; the unit id is the RS-485 address the command is sent to.
 gas_inlet_MFC_unit_id = 'A'
+gas_inlet_MFC_port = 'COM4'
+gas_inlet_MFC_unit_type = 'MFC'
+
+filter_line_alicat_unit_id = 'B'
+filter_line_alicat_port = 'COM4'
+filter_line_alicat_unit_type = 'Sensor Only'
 
 create_pressure_log_csv(outer_vessel_pressure_log_filepath)
 create_H2O_log_csv(vaisala_H2O_log_filepath)
+create_Alicat_log_csv(alicat_gas_inlet_log_filepath, gas_inlet_MFC_unit_type)
+create_Alicat_log_csv(alicat_filter_line_log_filepath, filter_line_alicat_unit_type)
 
 '''CHANNELS -- each data source is declared once, independent of which plot (if any) displays it.
 Alarm thresholds live here; see core_tools/alarms.py for what each AlarmSpec field means.'''
@@ -66,9 +71,6 @@ plotter.add_channel(id='gas_inlet_flow', label='GI Flow', long_label='Gas Inlet 
 plotter.add_channel(id='gas_inlet_flow_setpoint', label='GI Flow SP', long_label='Gas Inlet Flowrate Setpoint',
                      filepath=alicat_gas_inlet_log_filepath, datatype='gas_inlet_flowrate_setpoint',
                      units='SLPM', log_interval_s=2, overview_group='Gas Inlet')
-plotter.add_channel(id='gas_inlet_valve_drive', label='GI Valve Drive', long_label='Gas Inlet Valve Drive',
-                     filepath=alicat_gas_inlet_log_filepath, datatype='gas_inlet_valve_drive',
-                     units='%', log_interval_s=2, overview_group='Gas Inlet')
 #Both Alicat absolute-pressure channels get low=0.0 with NO deadband: an absolute
 #pressure cannot be negative, so this is an impossible-value check (a broken/unscaled
 #sensor -- the filter line currently reads a steady -1110 Torr), not a limit near a
@@ -135,11 +137,6 @@ pressure_tab.add_plot(plot_id='gas_inlet_flow_setpoint', title=gas_inlet_flow_se
                        x_axis=('Time since present', 's'), y_axis=('Flowrate', 'SLPM'),
                        offsets=[gas_inlet_flow_setpoint_offset], group='Gas Inlet')
 
-gas_inlet_valve_drive_plot_title = 'Gas Inlet Valve Drive'
-pressure_tab.add_plot(plot_id='gas_inlet_valve_drive', title=gas_inlet_valve_drive_plot_title, channels=['gas_inlet_valve_drive'],
-                       x_axis=('Time since present', 's'), y_axis=('Valve Drive', '%'),
-                       offsets=[gas_inlet_valve_drive_offset], group='Gas Inlet')
-
 gas_inlet_pressure_plot_title = 'Gas Inlet Pressure'
 pressure_tab.add_plot(plot_id='gas_inlet_pressure', title=gas_inlet_pressure_plot_title, channels=['gas_inlet_pressure'],
                        x_axis=('Time since present', 's'), y_axis=('Pressure', 'Torr'),
@@ -178,15 +175,48 @@ pressure_tab.add_logger_control(id='log_ov_pressure', label='OV Pressure', scrip
 pressure_tab.add_logger_control(id='log_h2o', label='H2O Concentration', script='log_H2O_readings.py',
                                  log_filepath=vaisala_H2O_log_filepath, port='COM5',
                                  interval_options=log_interval_options, default_interval=2)
+#Both Alicats log through the same script; unit id and unit type are passed as
+#extra_args, which the dock inserts between the port and the interval to match
+#log_Alicat_readings.py's <log_filepath> <port> <unit_id> <unit_type> <interval>.
+#WARNING: both units share one RS-485 bus behind one USB adapter, and a serial port has
+#exactly one owner. Only ONE of these two loggers can run at a time, and while either
+#runs the MFC setpoint control -- and so the over-pressure interlock -- cannot open the
+#port. Polling both units at once needs a single process that owns the bus.
+pressure_tab.add_logger_control(id='log_gas_inlet_alicat', label='Gas Inlet Alicat',
+                                 script='log_Alicat_readings.py',
+                                 log_filepath=alicat_gas_inlet_log_filepath, port=gas_inlet_MFC_port,
+                                 extra_args=[gas_inlet_MFC_unit_id, gas_inlet_MFC_unit_type],
+                                 interval_options=log_interval_options, default_interval=2)
+pressure_tab.add_logger_control(id='log_filter_line_alicat', label='Filter Line Alicat',
+                                 script='log_Alicat_readings.py',
+                                 log_filepath=alicat_filter_line_log_filepath, port=filter_line_alicat_port,
+                                 extra_args=[filter_line_alicat_unit_id, filter_line_alicat_unit_type],
+                                 interval_options=log_interval_options, default_interval=2)
 
 #Gas inlet MFC setpoint -- a one-shot command, not a logger: each press runs
-#alicat_MFC_control.py once and reports whether the controller acknowledged. The
-#resulting setpoint is read back by the Alicat log and plotted as 'gas_inlet_flow_setpoint'.
+#alicat_MFC_setpoint_control.py once and reports whether the controller acknowledged.
+#The resulting setpoint is read back by the Gas Inlet Alicat logger above and plotted
+#as 'gas_inlet_flow_setpoint'.
 pressure_tab.add_setpoint_control(id='setpoint_gas_inlet_mfc', label='Gas Inlet MFC',
-                                   script='alicat_MFC_control.py', unit_id=gas_inlet_MFC_unit_id,
-                                   port='COM4', units='SLPM',
+                                   script='alicat_MFC_setpoint_control.py', unit_id=gas_inlet_MFC_unit_id,
+                                   port=gas_inlet_MFC_port, units='SLPM',
                                    min_value=0.0, max_value=50.0,
                                    decimals=2, default_value=0.0)
+
+'''SAFETY INTERLOCKS -- declared after the channels and the setpoint control they name,
+because every reference is validated here and a bad one raises at startup rather than
+arming an interlock that could never fire.'''
+#Over-pressure in the outer vessel shuts the gas inlet. This rides the OV pressure
+#ALARM itself (760 Torr, declared once above) rather than re-testing the value, so
+#there is no second threshold that can drift out of agreement with the alarm limit --
+#and it inherits that alarm's 3-sample debounce, so it trips ~6s after the first
+#breach rather than on a single noisy sample. trip_on_stale also shuts the gas when
+#the OV reading stops arriving at all: gas flowing into a vessel whose pressure
+#nobody is watching is the case this exists to prevent.
+plotter.add_interlock(id='ov_overpressure_stops_gas', label='OV Over-pressure',
+                       trigger_channels=['ov_pressure_g1', 'ov_pressure_g2'],
+                       setpoint_control='setpoint_gas_inlet_mfc',
+                       safe_value=0.0, trip_on_stale=True)
 
 '''VMM TEMPERATURES TAB -- tile grid + one overlay plot (§5.4), not 16 separate plots'''
 vmm_plot_ids = [f'vmm_temp_{i}' for i in range(num_vmms)]

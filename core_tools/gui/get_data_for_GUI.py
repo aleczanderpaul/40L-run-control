@@ -205,11 +205,6 @@ def get_alicat_flowrate_setpoint(dataframe):
 
     return pd.Series(setpoint, name='Mass Flow Setpoint', index=dataframe.index)
 
-def get_alicat_valve_drive(dataframe):
-    valve_drive = pd.to_numeric(dataframe['valve_drive_percentage'], errors='coerce')
-
-    return pd.Series(valve_drive, name='Valve Drive Percentage', index=dataframe.index)
-
 def get_n_XY_datapoints(data_filepath, n, datatype, vmm_num):
     if datatype == 'vmm_temperature':
         dataframe = read_last_n_rows_filtered(data_filepath, n, vmm_num)
@@ -252,10 +247,6 @@ def get_n_XY_datapoints(data_filepath, n, datatype, vmm_num):
         times = get_seconds_ago(dataframe)
         setpoints = get_alicat_flowrate_setpoint(dataframe)
         return times, setpoints
-    elif datatype == 'gas_inlet_valve_drive':
-        times = get_seconds_ago(dataframe)
-        valve_drives = get_alicat_valve_drive(dataframe)
-        return times, valve_drives
     else:
         # Raise an error if the datatype is not supported
         raise ValueError(f"Unsupported datatype: {datatype}.")

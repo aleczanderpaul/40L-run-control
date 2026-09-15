@@ -12,7 +12,7 @@ import platform
 import serial.tools.list_ports
 
 from .get_data_for_GUI import get_n_XY_datapoints
-from .models import Channel, Plot, LoggerControl, SetpointControl, AggregateTile
+from .models import Channel, Plot, LoggerControl, SetpointControl, Interlock, AggregateTile
 from .decimate import decimate_min_max
 from .data_cache import ScanRunnable
 from .palette import channel_palette
@@ -39,6 +39,15 @@ ALARM_COLOR = '#e74c3c'
 # what keeps a controller that never answers from leaving the Set button disabled
 # forever; it must stay comfortably above that normal round trip.
 SETPOINT_TIMEOUT_S = 15
+
+# A tripped interlock's safe-value command is retried until the controller
+# acknowledges it, because a safety action that quietly failed is worse than none at
+# all. Bounded, though: against a dead port every attempt fails instantly, and an
+# unbounded retry would bury the event log in the one situation where the operator
+# most needs to read it. After the cap the interlock stops commanding and says, in
+# red and in the log, that the gas has to be shut manually.
+INTERLOCK_RETRY_DELAY_S = 2.0
+INTERLOCK_MAX_ATTEMPTS = 5
 
 # How often the alarm scanner reads every registered channel, and the FLOOR on how
 # many trailing rows each read fetches -- a floor for alarm evaluation's benefit
@@ -289,6 +298,55 @@ def setpoint_acknowledged(exit_code, reply):
     return exit_code == 0 and reply.startswith('Successfully set setpoint')
 
 
+def interlock_should_trip(transition, trigger_channel_ids, trip_on_stale):
+    """Does this alarm transition fire an interlock watching these channels?
+
+    Entering ALARM always trips. Entering STALE trips only if the interlock was
+    declared with trip_on_stale: a channel that stopped reporting isn't reading high,
+    but it isn't reading safe either, and an interlock that guards a vessel can't
+    treat "I don't know" as "it's fine".
+
+    NO_DATA deliberately does NOT trip. The evaluator reaches it on NaN readings,
+    which core_tools/alarms.py treats as a normal, intentionally-off gauge -- tripping
+    on it would shut the gas every time a gauge is switched off on purpose.
+
+    Only transitions *into* a state count. The evaluator emits a transition per state
+    change, so a channel sitting in ALARM produces nothing further and an interlock
+    can't be re-fired by an alarm it already acted on.
+    """
+    if transition.channel_id not in trigger_channel_ids:
+        return False
+    if transition.to_state == AlarmState.ALARM:
+        return True
+    return trip_on_stale and transition.to_state == AlarmState.STALE
+
+
+def interlock_reset_blockers(alarm_states):
+    """Which trigger channels are not confirmed good, as [(channel_id, reason)].
+
+    Used for two things that turn out to be the same question: whether an interlock
+    may arm, and whether a tripped one may be reset. Both need every trigger channel
+    *confirmed good* -- not merely "not in ALARM". STALE and NO_DATA both mean the
+    pressure is currently unknown, and letting gas into a vessel whose pressure nobody
+    can see is exactly what the interlock exists to prevent.
+
+    A channel that has produced no data at all blocks too. ChannelAlarmState starts at
+    OK before anything has been read, so reading that default as a good sample would
+    arm the interlock on a channel nobody has heard from -- and it would then trip the
+    moment the scan noticed the log file was stale, which is every launch made before
+    the logger is started.
+
+    An empty list means armed / resettable.
+    """
+    blockers = []
+    for channel_id, state in alarm_states.items():
+        if state.last_timestamp is None:
+            blockers.append((channel_id, 'no data yet'))
+        elif state.state != AlarmState.OK:
+            blockers.append((channel_id, state.state.value))
+    return blockers
+
+
 def limit_description(alarm):
     if alarm is None:
         return ""
@@ -471,6 +529,7 @@ class LivePlotter:
         self._scan_in_flight = False
         self._active_scan_runnable = None  # the scan is done; safe to let it be collected
         now = time.time()
+        all_transitions = []
 
         for channel_id, result in results.items():
             channel = self.channels[channel_id]
@@ -494,6 +553,7 @@ class LivePlotter:
             for transition in transitions:
                 level = 'ALARM' if transition.to_state in (AlarmState.ALARM, AlarmState.STALE) else 'INFO'
                 self.log(transition.message, level=level)
+            all_transitions += transitions
             if newest_ts is not None:
                 self._alarm_last_ts[channel_id] = newest_ts
 
@@ -518,6 +578,11 @@ class LivePlotter:
             for tab in self.tab_objects.values():
                 if isinstance(tab, VMMTab) and not tab.paused and channel_id in tab.curves:
                     tab.curves[channel_id].setData(x=dec_x, y=dec_y)
+
+        # Interlocks act on the same transitions the banner and event log just got,
+        # ahead of the visual refresh: if an over-pressure is going to shut the gas,
+        # the command should already be on its way by the time the banner appears.
+        self.control_dock.handle_alarm_transitions(all_transitions)
 
         self._refresh_note_markers(now)
         self._refresh_alarm_visuals(now)
@@ -605,6 +670,17 @@ class LivePlotter:
             plot.plot_widget.setTitle(plot.title)
 
     # Create a tab in the window to put plots and buttons in
+    # Declared on the plotter, not on a tab: an interlock is a system-wide safety
+    # rule, not part of any one tab's display. Declare it AFTER the setpoint control
+    # and the trigger channels it names -- it validates every reference immediately
+    # and raises rather than arming an interlock that could never fire.
+    def add_interlock(self, id, label, trigger_channels, setpoint_control, safe_value, trip_on_stale=True):
+        return self.control_dock.add_interlock_group(
+            id=id, label=label, trigger_channel_ids=trigger_channels,
+            setpoint_control_id=setpoint_control, safe_value=safe_value,
+            trip_on_stale=trip_on_stale,
+        )
+
     def create_tab(self, tab_name, plots_per_row):
         tab = LiveTab(plots_per_row, plotter=self)
         tab.tab_name = tab_name
@@ -929,10 +1005,12 @@ class LiveTab(QtWidgets.QWidget):
 
     # Register a logger's controls (LED, port, interval, start/stop) in the shared
     # control dock -- see ControlDock.add_logger_group for what this actually builds.
-    def add_logger_control(self, id, label, script, log_filepath, port, interval_options, default_interval):
+    def add_logger_control(self, id, label, script, log_filepath, port, interval_options,
+                           default_interval, extra_args=None):
         return self.plotter.control_dock.add_logger_group(
             id=id, label=label, script=script, log_filepath=log_filepath, port=port,
             interval_options=interval_options, default_interval=default_interval,
+            extra_args=extra_args,
         )
 
     # Register an Alicat MFC setpoint control (LED, port, value box, Set) in the same
@@ -966,6 +1044,7 @@ class ControlDock(QtWidgets.QWidget):
         self.plotter = plotter
         self.loggers = {}  # id -> LoggerControl
         self.setpoints = {}  # id -> SetpointControl
+        self.interlocks = {}  # id -> Interlock
 
         self.layout = QtWidgets.QVBoxLayout()
         self.setLayout(self.layout)
@@ -978,6 +1057,11 @@ class ControlDock(QtWidgets.QWidget):
         # as a Start/Stop that only affects what gets recorded.
         self.setpoints_layout = QtWidgets.QVBoxLayout()
         self.layout.addLayout(self.setpoints_layout)
+
+        # Below the control each one latches, so the trip state and the locked Set
+        # button read as one thing.
+        self.interlocks_layout = QtWidgets.QVBoxLayout()
+        self.layout.addLayout(self.interlocks_layout)
 
         window_row = QtWidgets.QHBoxLayout()
         window_row.addWidget(QtWidgets.QLabel('Window:'))
@@ -1037,6 +1121,9 @@ class ControlDock(QtWidgets.QWidget):
         # if nothing else touches that logger's controls.
         self._status_timer = QtCore.QTimer()
         self._status_timer.timeout.connect(self._poll_loggers)
+        # Same timer, separate concern: retries a tripped interlock's unconfirmed
+        # command and keeps its Reset button in step with the live alarm states.
+        self._status_timer.timeout.connect(self._service_interlocks)
         self._status_timer.start(500)
 
     def _on_note_entered(self):
@@ -1099,10 +1186,12 @@ class ControlDock(QtWidgets.QWidget):
     # Build one logger's group box: LED, port dropdown (from the live serial port
     # list, defaulting to the declared port), interval dropdown, start/stop button,
     # and a hidden error line that appears only on an unexpected exit.
-    def add_logger_group(self, id, label, script, log_filepath, port, interval_options, default_interval):
+    def add_logger_group(self, id, label, script, log_filepath, port, interval_options,
+                         default_interval, extra_args=None):
         logger = LoggerControl(
             id=id, label=label, script=script, log_filepath=log_filepath,
             interval_options=interval_options, default_interval=default_interval, port=port,
+            extra_args=[str(a) for a in (extra_args or [])],
         )
 
         box = QtWidgets.QGroupBox(label)
@@ -1175,7 +1264,12 @@ class ControlDock(QtWidgets.QWidget):
         # argv is a real list -- never a shell string -- so filenames/ports with
         # spaces need no special handling, and sys.executable ensures the venv
         # interpreter (not a bare 'python' off PATH) runs the logger.
-        argv = [sys.executable, logger.script, logger.log_filepath, port, str(interval)]
+        # extra_args sits between the port and the interval, which is where a script
+        # that needs more than <log_filepath> <port> <interval> takes them (an Alicat
+        # needs its unit id and unit type there). A real argv list, so an argument
+        # containing a space -- 'Sensor Only' -- arrives as one argument.
+        argv = [sys.executable, logger.script, logger.log_filepath, port,
+                *logger.extra_args, str(interval)]
 
         process = subprocess.Popen(argv, stderr=subprocess.PIPE, text=True, bufsize=1)
         logger.process = process
@@ -1193,7 +1287,8 @@ class ControlDock(QtWidgets.QWidget):
         logger.start_stop_button.setStyleSheet("background-color: red;")
         logger.error_label.hide()
         self._set_led(logger, 'running')
-        self.plotter.log(f"Started logger: {logger.label} ({port}, {interval}s)", level='INFO')
+        extras = f", {' '.join(logger.extra_args)}" if logger.extra_args else ''
+        self.plotter.log(f"Started logger: {logger.label} ({port}{extras}, {interval}s)", level='INFO')
 
     def _read_stderr(self, logger):
         # Runs on a background thread -- must not touch Qt widgets or self.plotter
@@ -1271,9 +1366,7 @@ class ControlDock(QtWidgets.QWidget):
         led.setFixedSize(12, 12)
         control.led = led
         status_row.addWidget(led)
-        # The unit id is shown, not just declared: several Alicats can share one RS-485
-        # line, and it is the only thing distinguishing which one a command addresses.
-        status_row.addWidget(QtWidgets.QLabel(f'{label} (unit {unit_id})'))
+        status_row.addWidget(QtWidgets.QLabel(label))
         status_row.addStretch(1)
         box_layout.addLayout(status_row)
 
@@ -1316,10 +1409,23 @@ class ControlDock(QtWidgets.QWidget):
         self.setpoints_layout.addWidget(box)
         return control
 
+    # The operator path: validate, confirm, then hand off to the shared dispatcher.
+    # An interlock's safe-value command deliberately does NOT come through here -- it
+    # must not be blocked by the lock it just applied, and it must not sit waiting on
+    # a modal dialog.
     def _send_setpoint(self, setpoint_id):
         control = self.setpoints[setpoint_id]
         if control.sending:
             return  # button is disabled while in flight; this is the belt to that braces
+
+        # Refusing here as well as disabling the button: the lock is a safety state,
+        # so it can't rest on a widget's enabled flag alone.
+        if control.locked_by is not None:
+            interlock = self.interlocks.get(control.locked_by)
+            name = interlock.label if interlock is not None else control.locked_by
+            self.plotter.log(f"[{control.label}] setpoint refused: {name} is tripped "
+                             f"and must be reset first", level='ERROR')
+            return
 
         value = control.value_spinbox.value()
         port = control.port_combo.currentText()
@@ -1338,6 +1444,17 @@ class ControlDock(QtWidgets.QWidget):
                 self.plotter.log(f"[{control.label}] setpoint {value:g} {control.units} cancelled", level='INFO')
                 return
 
+        self._dispatch_setpoint(control, value, source='operator')
+
+    # Actually fire one command. Shared by the operator's Set button and by an
+    # interlock's safe-value command; `source` is what the result handler uses to
+    # tell them apart. Returns False if the port is already busy, which is the
+    # interlock's cue to try again on its next tick rather than to give up.
+    def _dispatch_setpoint(self, control, value, source):
+        if control.sending:
+            return False
+
+        port = control.port_combo.currentText()
         # Same argv discipline as a logger (a real list, sys.executable), but a
         # different argument order -- alicat_MFC_control.py takes
         # <serial_port> <unit_id> <setpoint>, with no log file and no interval.
@@ -1345,15 +1462,18 @@ class ControlDock(QtWidgets.QWidget):
 
         control.sending = True
         control.last_sent_value = value
+        control.command_source = source
         control.send_button.setEnabled(False)
         control.send_button.setText('Sending...')
         control.status_label.hide()
         self._set_led(control, 'sending')
+        via = '' if source == 'operator' else f' [{source}]'
         self.plotter.log(f"[{control.label}] sending setpoint {value:g} {control.units} "
-                         f"({port}, unit {control.unit_id})", level='INFO')
+                         f"({port}, unit {control.unit_id}){via}", level='INFO')
 
         thread = threading.Thread(target=self._run_setpoint, args=(control.id, argv), daemon=True)
         thread.start()
+        return True
 
     def _run_setpoint(self, setpoint_id, argv):
         # Runs on a background thread -- must not touch Qt widgets or self.plotter
@@ -1377,8 +1497,13 @@ class ControlDock(QtWidgets.QWidget):
             return
 
         control.sending = False
-        control.send_button.setEnabled(True)
+        source = control.command_source
+        control.command_source = None
         control.send_button.setText(f'Set {control.label}')
+        # A latched control stays disabled whatever this command's outcome was --
+        # including the operator command that happened to be in flight when the
+        # interlock tripped.
+        control.send_button.setEnabled(control.locked_by is None)
 
         reply = last_line(stdout)
         error = last_line(stderr)
@@ -1401,6 +1526,275 @@ class ControlDock(QtWidgets.QWidget):
             # be silently swallowed -- the controller may still be at its old value.
             self.plotter.log(f"[{control.label}] setpoint {value_text} FAILED: {detail}", level='ERROR')
         control.status_label.show()
+
+        if source is not None and source != 'operator':
+            self._on_interlock_command_result(source, acknowledged, reply or error or f'exit code {exit_code}')
+
+    # Build one interlock's group box: LED, what it watches and what it does, a live
+    # status line, and a Reset button that stays disabled until a reset is actually
+    # allowed. Deliberately the last block in the dock, under the control it latches.
+    def add_interlock_group(self, id, label, trigger_channel_ids, setpoint_control_id,
+                            safe_value, trip_on_stale):
+        # Fail at startup, not silently at trip time. A typo in a channel id or a
+        # control id would otherwise produce an interlock that looks armed in the GUI
+        # and does nothing when the pressure actually rises -- the single worst
+        # failure mode this feature has.
+        if setpoint_control_id not in self.setpoints:
+            raise ValueError(f"interlock {id!r}: no setpoint control {setpoint_control_id!r} "
+                             f"(declare it before the interlock; known: {sorted(self.setpoints)})")
+        unknown = [c for c in trigger_channel_ids if c not in self.plotter.channels]
+        if unknown:
+            raise ValueError(f"interlock {id!r}: unknown trigger channel(s) {unknown} "
+                             f"(known: {sorted(self.plotter.channels)})")
+        without_alarm = [c for c in trigger_channel_ids if self.plotter.channels[c].alarm is None]
+        if without_alarm:
+            raise ValueError(f"interlock {id!r}: trigger channel(s) {without_alarm} have no AlarmSpec, "
+                             f"so they can never enter ALARM and the interlock could never trip")
+
+        interlock = Interlock(
+            id=id, label=label, trigger_channel_ids=list(trigger_channel_ids),
+            setpoint_control_id=setpoint_control_id, safe_value=safe_value,
+            trip_on_stale=trip_on_stale,
+        )
+
+        control = self.setpoints[setpoint_control_id]
+        box = QtWidgets.QGroupBox(f'{label} (interlock)')
+        box_layout = QtWidgets.QVBoxLayout()
+        box.setLayout(box_layout)
+
+        status_row = QtWidgets.QHBoxLayout()
+        led = QtWidgets.QLabel()
+        led.setFixedSize(12, 12)
+        interlock.led = led
+        status_row.addWidget(led)
+        status_row.addWidget(QtWidgets.QLabel(label))
+        status_row.addStretch(1)
+        box_layout.addLayout(status_row)
+
+        # Spelled out rather than left to the launch file: an operator looking at the
+        # dock has to be able to see what this thing will do to the gas, and on what.
+        triggers = ', '.join(self.plotter.channels[c].label for c in trigger_channel_ids)
+        summary = QtWidgets.QLabel(f'{triggers} in alarm '
+                                   f'{"or stale " if trip_on_stale else ""}'
+                                   f'→ {control.label} to {safe_value:g} {control.units}')
+        summary.setStyleSheet('font-size: 10px; color: #7f8c8d;')
+        summary.setWordWrap(True)
+        box_layout.addWidget(summary)
+
+        status_label = QtWidgets.QLabel('')
+        status_label.setStyleSheet('font-size: 10px;')
+        status_label.setWordWrap(True)
+        interlock.status_label = status_label
+        box_layout.addWidget(status_label)
+
+        reset_button = QtWidgets.QPushButton('Reset Interlock')
+        reset_button.setToolTip('Re-enables the setpoint control. Allowed only once every '
+                                'trigger channel is reading OK again.')
+        reset_button.clicked.connect(lambda _, iid=id: self._reset_interlock(iid))
+        interlock.reset_button = reset_button
+        box_layout.addWidget(reset_button)
+
+        self.interlocks[id] = interlock
+        self._refresh_interlock(interlock)
+        self.interlocks_layout.addWidget(box)
+        return interlock
+
+    # Called once per scan tick with every transition the alarm evaluator produced.
+    # The interlock rides the alarm state machine rather than comparing values itself,
+    # so it fires on exactly the event the operator sees in the banner.
+    def handle_alarm_transitions(self, transitions):
+        if not self.interlocks:
+            return
+        if not transitions:
+            for interlock in self.interlocks.values():
+                self._update_armed(interlock)
+            return
+        for interlock in self.interlocks.values():
+            self._update_armed(interlock)
+            if interlock.tripped or not interlock.armed:
+                continue  # already tripped (a second trigger changes nothing), or not yet armed
+            for transition in transitions:
+                if interlock_should_trip(transition, interlock.trigger_channel_ids, interlock.trip_on_stale):
+                    self._trip_interlock(interlock, transition.message)
+                    break
+
+    # Arms on the first tick where every trigger channel reads OK. That is the same
+    # predicate a reset uses -- "every trigger channel is confirmed good" is exactly
+    # what makes it safe both to start guarding and to let flow resume.
+    def _update_armed(self, interlock):
+        if interlock.armed or self._blocking_channels(interlock):
+            return
+        interlock.armed = True
+        self.plotter.log(f"INTERLOCK {interlock.label} armed", level='INFO')
+        self._refresh_interlock(interlock)
+
+    def _trip_interlock(self, interlock, reason):
+        control = self.setpoints[interlock.setpoint_control_id]
+        interlock.tripped = True
+        interlock.trip_reason = reason
+        interlock.trip_timestamp = time.time()
+        interlock.command_confirmed = False
+        interlock.attempts = 0
+        interlock.next_attempt_time = None
+        interlock.gave_up = False
+
+        # Latch first, command second. If the command is slow (or the port is busy
+        # with an operator's command) the control must already be refusing new flow
+        # by the time anyone can click it.
+        control.locked_by = interlock.id
+        control.send_button.setEnabled(False)
+        # A greyed-out button with no explanation is its own failure mode -- the one
+        # moment the operator most needs to know why they can't command flow.
+        control.send_button.setToolTip(f'Locked: {interlock.label} interlock is tripped. '
+                                       f'Reset it below to command flow again.')
+
+        self.plotter.log(f"INTERLOCK {interlock.label} TRIPPED ({reason}) -- driving "
+                         f"{control.label} to {interlock.safe_value:g} {control.units}", level='ALARM')
+        self._attempt_interlock_command(interlock)
+        self._refresh_interlock(interlock)
+
+    def _attempt_interlock_command(self, interlock):
+        control = self.setpoints[interlock.setpoint_control_id]
+        if interlock.attempts >= INTERLOCK_MAX_ATTEMPTS:
+            if not interlock.gave_up:
+                interlock.gave_up = True
+                self.plotter.log(f"INTERLOCK {interlock.label} COULD NOT SET {control.label} to "
+                                 f"{interlock.safe_value:g} {control.units} after "
+                                 f"{INTERLOCK_MAX_ATTEMPTS} attempts -- SHUT THE GAS MANUALLY",
+                                 level='ALARM')
+                self._refresh_interlock(interlock)
+            return
+        interlock.attempts += 1
+        if not self._dispatch_setpoint(control, interlock.safe_value, source=interlock.id):
+            # Port busy with another command -- not a failure, so don't spend the
+            # attempt; back it out and let the next tick try again.
+            interlock.attempts -= 1
+            interlock.next_attempt_time = time.time() + 0.5
+
+    def _on_interlock_command_result(self, interlock_id, acknowledged, detail):
+        interlock = self.interlocks.get(interlock_id)
+        if interlock is None:
+            return
+        control = self.setpoints[interlock.setpoint_control_id]
+        if acknowledged:
+            interlock.command_confirmed = True
+            interlock.next_attempt_time = None
+            # The controller is at the safe value now, so the box has to read it too --
+            # leaving the operator's old number showing would misstate the hardware.
+            interlock.gave_up = False
+            control.value_spinbox.setValue(interlock.safe_value)
+            self.plotter.log(f"INTERLOCK {interlock.label}: {control.label} confirmed at "
+                             f"{interlock.safe_value:g} {control.units}", level='ALARM')
+        else:
+            self.plotter.log(f"INTERLOCK {interlock.label}: attempt {interlock.attempts} of "
+                             f"{INTERLOCK_MAX_ATTEMPTS} to set {control.label} failed ({detail})",
+                             level='ALARM')
+            interlock.next_attempt_time = time.time() + INTERLOCK_RETRY_DELAY_S
+        self._refresh_interlock(interlock)
+
+    # Driven by the same 500ms timer that polls loggers: retries an unconfirmed safe
+    # command and keeps each Reset button's enabled state in step with the live alarm
+    # states (which change on scan ticks this dock never sees).
+    def _service_interlocks(self):
+        now = time.time()
+        for interlock in self.interlocks.values():
+            self._update_armed(interlock)
+            if (interlock.tripped and not interlock.command_confirmed and not interlock.gave_up
+                    and interlock.next_attempt_time is not None and now >= interlock.next_attempt_time):
+                interlock.next_attempt_time = None
+                self._attempt_interlock_command(interlock)
+            self._refresh_interlock(interlock)
+
+    # A reset is allowed only once every trigger channel is reading OK again -- not
+    # merely "not in alarm". STALE and NO_DATA both mean the vessel's pressure is
+    # currently unknown, and re-opening gas on an unknown pressure is the thing this
+    # interlock exists to prevent.
+    def _blocking_channels(self, interlock):
+        states = {channel_id: self.plotter.alarm_evaluator.state_for(channel_id)
+                  for channel_id in interlock.trigger_channel_ids}
+        return [(self.plotter.channels[channel_id].label, reason)
+                for channel_id, reason in interlock_reset_blockers(states)]
+
+    def _reset_interlock(self, interlock_id):
+        interlock = self.interlocks[interlock_id]
+        if not interlock.tripped:
+            return
+        blocking = self._blocking_channels(interlock)
+        if blocking:
+            detail = ', '.join(f'{label} {state}' for label, state in blocking)
+            self.plotter.log(f"INTERLOCK {interlock.label}: reset refused, still {detail}", level='ERROR')
+            self._refresh_interlock(interlock)
+            return
+
+        control = self.setpoints[interlock.setpoint_control_id]
+        interlock.tripped = False
+        interlock.command_confirmed = False
+        interlock.gave_up = False
+        interlock.attempts = 0
+        interlock.next_attempt_time = None
+        interlock.trip_reason = ''
+        interlock.trip_timestamp = None
+
+        control.locked_by = None
+        control.send_button.setEnabled(not control.sending)
+        control.send_button.setToolTip('')
+        # Reset unlocks the control; it deliberately does NOT restore the setpoint
+        # that was in force before the trip. Flow only ever resumes because someone
+        # typed a value and pressed Set.
+        self.plotter.log(f"INTERLOCK {interlock.label} reset -- {control.label} re-enabled "
+                         f"(still at {interlock.safe_value:g} {control.units})", level='INFO')
+        self._refresh_interlock(interlock)
+
+    def _refresh_interlock(self, interlock):
+        control = self.setpoints[interlock.setpoint_control_id]
+        if not interlock.armed:
+            # Honest about not guarding anything yet, rather than showing a reassuring
+            # "Armed" while the pressure data it watches hasn't arrived.
+            blocking = self._blocking_channels(interlock)
+            waiting = ', '.join(f'{label} {state}' for label, state in blocking)
+            self._set_led(interlock, 'stopped')
+            interlock.status_label.setStyleSheet('color: #7f8c8d; font-size: 10px;')
+            interlock.status_label.setText(f'Not armed — waiting for good data ({waiting}). '
+                                           f'Arms automatically once every channel reads OK.')
+            interlock.reset_button.setEnabled(False)
+            return
+        if not interlock.tripped:
+            self._set_led(interlock, 'running')
+            interlock.status_label.setStyleSheet('color: #2ecc71; font-size: 10px;')
+            interlock.status_label.setText('Armed')
+            interlock.reset_button.setEnabled(False)
+            return
+
+        tripped_at = time.strftime('%H:%M:%S', time.localtime(interlock.trip_timestamp))
+        if interlock.command_confirmed:
+            self._set_led(interlock, 'crashed')
+            interlock.status_label.setStyleSheet(f'color: {ALARM_COLOR}; font-size: 10px;')
+            interlock.status_label.setText(
+                f'TRIPPED {tripped_at} — {interlock.trip_reason}. {control.label} at '
+                f'{interlock.safe_value:g} {control.units}; setpoint locked.')
+        elif interlock.gave_up:
+            self._set_led(interlock, 'crashed')
+            interlock.status_label.setStyleSheet(f'color: {ALARM_COLOR}; font-weight: bold; font-size: 10px;')
+            interlock.status_label.setText(
+                f'TRIPPED {tripped_at} — {interlock.trip_reason}. COULD NOT SET {control.label} '
+                f'to {interlock.safe_value:g} {control.units} — SHUT THE GAS MANUALLY.')
+        else:
+            self._set_led(interlock, 'sending')
+            interlock.status_label.setStyleSheet(f'color: {ALARM_COLOR}; font-weight: bold; font-size: 10px;')
+            interlock.status_label.setText(
+                f'TRIPPED {tripped_at} — {interlock.trip_reason}. Setting {control.label} to '
+                f'{interlock.safe_value:g} {control.units} (attempt {max(interlock.attempts, 1)} of '
+                f'{INTERLOCK_MAX_ATTEMPTS})…')
+
+        blocking = self._blocking_channels(interlock)
+        interlock.reset_button.setEnabled(not blocking)
+        if blocking:
+            interlock.reset_button.setToolTip(
+                'Reset blocked until every trigger channel reads OK: '
+                + ', '.join(f'{label} is {state}' for label, state in blocking))
+        else:
+            interlock.reset_button.setToolTip('Re-enables the setpoint control. The setpoint itself '
+                                              'stays at the safe value until you set a new one.')
 
     def cleanup(self):
         for logger in self.loggers.values():

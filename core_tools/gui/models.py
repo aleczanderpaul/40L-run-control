@@ -71,6 +71,10 @@ class LoggerControl:
     interval_options: list  # [(option_label, seconds), ...]
     default_interval: float
     port: str
+    # Extra positional arguments this script needs between the port and the interval
+    # (e.g. an Alicat's unit id and unit type). Empty for a script that takes the
+    # standard <log_filepath> <port> <interval>.
+    extra_args: list = field(default_factory=list)
 
     # Runtime state, populated by ControlDock.add_logger_group() and mutated as it runs.
     process: object = None
@@ -109,9 +113,61 @@ class SetpointControl:
     # one is still in flight on the same serial port.
     sending: bool = False
     last_sent_value: float | None = None
+    # Which id the in-flight command was issued on behalf of ('operator', or an
+    # interlock's id). The result handler needs it to tell an operator's command from
+    # a safety command that has to be retried if it didn't land.
+    command_source: str | None = None
+    # Set to a tripped interlock's id while that interlock latches this control. A
+    # locked control refuses every operator command until the interlock is reset.
+    locked_by: str | None = None
 
     port_combo: object = None
     value_spinbox: object = None
     send_button: object = None
     led: object = None
     status_label: object = None
+
+
+@dataclass
+class Interlock:
+    """One automatic safety action: when any trigger channel goes into alarm, drive a
+    setpoint control to its safe value and latch it there.
+
+    The trigger is the *alarm state machine's* transition, not a raw comparison, so
+    the interlock inherits that channel's debounce (AlarmSpec.consecutive_samples)
+    and trips on exactly the condition the operator already sees in the banner --
+    there is deliberately no second, separately-tunable threshold that could drift
+    out of agreement with the alarm limit declared in launch_GUI.py."""
+    id: str
+    label: str
+    trigger_channel_ids: list[str]
+    setpoint_control_id: str
+    safe_value: float
+    trip_on_stale: bool = True
+
+    # Runtime state, populated by ControlDock.add_interlock_group() and mutated as it
+    # trips and is reset.
+    #
+    # An interlock starts DISARMED and arms the first time every trigger channel
+    # reads OK. Without that, launching the GUI before the pressure logger is started
+    # trips it instantly -- the log file still holds yesterday's rows, so the channel
+    # goes STALE within seconds of startup -- which would fire a doomed MFC command
+    # and raise a red banner on every single launch. An interlock that cries wolf at
+    # startup is one operators learn to ignore, which costs more safety than it buys.
+    # Arming is one-way: once a channel has been seen good, losing it later is a real
+    # loss of signal and must trip.
+    armed: bool = False
+    tripped: bool = False
+    trip_reason: str = ''
+    trip_timestamp: float | None = None
+    # Whether the safe-value command was actually acknowledged by the controller.
+    # Tripped-but-unconfirmed is the dangerous state: the interlock fired but the gas
+    # may still be flowing, so it is retried and shown in red until it lands.
+    command_confirmed: bool = False
+    attempts: int = 0
+    next_attempt_time: float | None = None
+    gave_up: bool = False
+
+    led: object = None
+    status_label: object = None
+    reset_button: object = None

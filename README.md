@@ -16,6 +16,7 @@ python launch_GUI.py
 - `launch_GUI.py` is the *design* — the only file a scientist needs to touch to add a channel, plot, alarm limit, logger, or status-strip tile. It's declarative: register channels, then plots/tabs that reference them by id.
 - `core_tools/alarms.py` is the alarm state machine. It's pure Python (no Qt) so it can be unit-tested and, later, run headless.
 - Data logging runs in **separate subprocesses** that write plain CSV/DAT files; the GUI only ever reads those files. This is deliberate — logs survive a GUI crash and stay usable for offline analysis. Never move logging into the GUI process.
+- Safety interlocks (over-pressure shuts the gas inlet MFC) ride the alarm state machine's transitions rather than re-testing values, so a limit is declared exactly once. See "Safety interlocks" below.
 - `core_tools/notes.py` is the operator-notes store. Pure Python (no Qt), same reasoning as `alarms.py`.
 - A single scan timer on `LivePlotter` (default 1s) reads every registered channel's file on a background thread, evaluates alarms, and pushes fresh data into every unpaused plot. There's no per-plot timer — pausing a plot only stops its own curve redraw; the channel keeps being evaluated for alarms regardless.
 
@@ -128,6 +129,37 @@ The value box is a hard-bounded spin box rather than a free-text field — the c
 Nothing about this control reads the setpoint back — that's the logger's job. The resulting setpoint shows up on the `gas_inlet_flow_setpoint` channel like any other reading, which is also how an operator confirms the controller is where they put it.
 
 In-flight setpoint commands are **not** killed on GUI shutdown (running loggers are). They're already bounded by the timeout, and killing one mid-write could leave the controller at a value nobody asked for.
+
+### Safety interlocks
+
+An interlock is an automatic action: when a channel goes into alarm, drive a setpoint control to a safe value and latch it there.
+
+```python
+plotter.add_interlock(
+    id='ov_overpressure_stops_gas',
+    label='OV Over-pressure',
+    trigger_channels=['ov_pressure_g1', 'ov_pressure_g2'],   # any one of them tripping is enough
+    setpoint_control='setpoint_gas_inlet_mfc',
+    safe_value=0.0,
+    trip_on_stale=True,
+)
+```
+
+Declared on the plotter rather than on a tab — it's a system-wide rule, not part of any one tab's display — and **after** the channels and setpoint control it names. Every reference is validated at declaration time and raises: a typo'd channel id would otherwise produce an interlock that looks armed in the GUI and does nothing when the pressure actually rises, which is the worst failure this feature has. A trigger channel with no `AlarmSpec` is rejected for the same reason — it could never enter `ALARM`.
+
+**It rides the alarm state machine, not a threshold of its own.** The trip condition is the `AlarmTransition` into `ALARM`, so the limit lives in exactly one place (the channel's `AlarmSpec`) and there's no second number that can drift out of agreement with the one on the plot. It also inherits that alarm's debounce, so with `consecutive_samples=3` on a 2 s channel it fires ~6 s after the first breach rather than on a single noisy sample.
+
+`trip_on_stale=True` also trips when the trigger channel stops reporting. A channel that went quiet isn't reading high, but it isn't reading safe either, and gas flowing into a vessel whose pressure nobody is watching is the case this exists to prevent. `NO_DATA` deliberately does **not** trip: the evaluator reaches it on NaN readings, which it treats as a normal intentionally-off gauge.
+
+**Arming.** An interlock starts *disarmed* and arms the first time every trigger channel is confirmed good — reading `OK`, with data actually having arrived. Without this, launching the GUI before the pressure logger is started trips it instantly (the log file still holds the previous run's rows, so the channel goes `STALE` within seconds), firing a doomed MFC command and raising a red banner on every launch. An interlock that cries wolf at startup is one operators learn to ignore, which costs more safety than it buys. Arming is one-way: once a channel has been seen good, losing it later is a real loss of signal and trips. While disarmed the dock says so plainly and locks nothing.
+
+**Latching.** A trip locks the setpoint control: its Set button is disabled (with a tooltip saying why) and the dispatcher refuses commands independently of the widget's enabled flag. **Reset Interlock** unlocks it, and is itself allowed only once every trigger channel is confirmed good again — the same predicate as arming. That's stricter than "the alarm cleared": `STALE` and `NO_DATA` block a reset too, because you can't reopen gas on a pressure nobody can see. Reset does **not** restore the previous setpoint; flow only ever resumes because someone typed a value and pressed Set.
+
+**If the safe-value command fails,** it's retried every `INTERLOCK_RETRY_DELAY_S` (2 s) up to `INTERLOCK_MAX_ATTEMPTS` (5) — a safety action that quietly failed is worse than none. Bounded, because against a dead port every attempt fails instantly and an unbounded retry would bury the event log in the one situation where the operator most needs to read it. After the cap the interlock stops commanding and says, in red and in the log, `COULD NOT SET ... SHUT THE GAS MANUALLY`. Until the controller acknowledges, the box stays red and reads *tripped but unconfirmed* — the dangerous state, where the interlock fired and the gas may still be flowing. A trip that lands while an operator's command is still on the port isn't a failure and doesn't spend an attempt; it retries as soon as the port frees up.
+
+Every trip, retry, confirmation, refusal and reset is logged to the Event Terminal at `ALARM`/`ERROR` level. The interlock has no presence in the alarm banner of its own — the channel alarm that caused it is already there — so its state lives in its dock group box.
+
+The decision logic (`interlock_should_trip`, `interlock_reset_blockers`) is pure and unit-tested in `tests/test_interlock.py`.
 
 ### Status strip
 
