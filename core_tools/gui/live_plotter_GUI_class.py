@@ -6,6 +6,7 @@ import time
 import math
 import datetime
 import pandas as pd
+import numpy as np
 import subprocess
 import threading
 import platform
@@ -152,12 +153,23 @@ def point_marker_budget(curve):
     return min(int(width / POINT_MARKER_MIN_SPACING_PX), SYMBOL_MAX_POINTS)
 
 
-def set_point_markers(curve, n_points):
-    """Show or hide a curve's dots for the number of points about to be drawn.
+def set_point_markers(curve, y_values):
+    """Show or hide a curve's dots for the data about to be drawn.
+
+    Counts the points that will actually be MARKED -- the finite ones -- not the length
+    of the array. A window where most samples are NaN draws far fewer dots than it has
+    rows, and a channel that is all NaN draws none at all: an intentionally-off gauge
+    (the low-range OV gauge above ~1 Torr) reads as NaN for every row in the window.
+
+    Zero finite points must turn the dots OFF rather than leave an empty scatter item
+    behind. pyqtgraph computes a scatter's bounds with np.nanmin/np.nanmax, which on an
+    all-NaN array warns "All-NaN slice encountered" on every redraw -- once per curve
+    per scan tick, which floods the console the logger prints share.
 
     Only touches the curve when the answer changes: setSymbol triggers a repaint, and
     this runs for every curve on every scan tick.
     """
+    n_points = int(np.isfinite(np.asarray(y_values, dtype=float)).sum()) if len(y_values) else 0
     wanted = 0 < n_points <= point_marker_budget(curve)
     if getattr(curve, '_markers_on', None) is wanted:
         return
@@ -693,13 +705,13 @@ class LivePlotter:
                 if plot is None or not plot.running:
                     continue
                 idx = plot.channel_ids.index(channel_id)
+                set_point_markers(plot.curves[idx], dec_y)
                 plot.curves[idx].setData(x=dec_x, y=dec_y + float(plot.offsets[idx]))
-                set_point_markers(plot.curves[idx], len(dec_x))
 
             for tab in self.tab_objects.values():
                 if isinstance(tab, VMMTab) and not tab.paused and channel_id in tab.curves:
+                    set_point_markers(tab.curves[channel_id], dec_y)
                     tab.curves[channel_id].setData(x=dec_x, y=dec_y)
-                    set_point_markers(tab.curves[channel_id], len(dec_x))
 
         # Interlocks act on the same transitions the banner and event log just got,
         # ahead of the visual refresh: if an over-pressure is going to shut the gas,
