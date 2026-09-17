@@ -17,6 +17,7 @@ python launch_GUI.py
 - `core_tools/alarms.py` is the alarm state machine. It's pure Python (no Qt) so it can be unit-tested and, later, run headless.
 - Data logging runs in **separate subprocesses** that write plain CSV/DAT files; the GUI only ever reads those files. This is deliberate — logs survive a GUI crash and stay usable for offline analysis. Never move logging into the GUI process.
 - Instruments sharing one serial adapter are served by a single bus subprocess that owns the port (`core_tools/AlicatTools/alicat_bus_server_functions.py`), opened on first use and closed on last. See "Shared serial buses" below.
+- The automatic gas fill is the only thing that commands gas from a measurement rather than a keystroke; see "Automatic gas fill" below for every way it refuses to.
 - Safety interlocks (over-pressure shuts the gas inlet MFC) ride the alarm state machine's transitions rather than re-testing values, so a limit is declared exactly once. See "Safety interlocks" below.
 - `core_tools/notes.py` is the operator-notes store. Pure Python (no Qt), same reasoning as `alarms.py`.
 - A single scan timer on `LivePlotter` (default 1s) reads every registered channel's file on a background thread, evaluates alarms, and pushes fresh data into every unpaused plot. There's no per-plot timer — pausing a plot only stops its own curve redraw; the channel keeps being evaluated for alarms regardless.
@@ -181,6 +182,37 @@ The value box is a hard-bounded spin box rather than a free-text field — the c
 Nothing about this control reads the setpoint back — that's the logger's job. The resulting setpoint shows up on the `gas_inlet_flow_setpoint` channel like any other reading, which is also how an operator confirms the controller is where they put it.
 
 In-flight one-shot setpoint commands are **not** killed on GUI shutdown (running loggers are). They're already bounded by the timeout, and killing one mid-write could leave the controller at a value nobody asked for.
+
+### Automatic gas fill
+
+A two-stage fill: open the MFC wide, then ease off before the target so the vessel doesn't sail past it.
+
+```python
+plotter.add_fill_control(
+    id='ov_gas_fill', label='OV Gas Fill',
+    setpoint_control='setpoint_gas_inlet_mfc',
+    pressure_channels=['ov_pressure_g1', 'ov_pressure_g2'],
+    pressure_units='Torr', max_pressure=760.0, pressure_decimals=1,
+    default_fast_flow=10.0,    # rate while there is room
+    default_slow_at=700.0,     # hand over to the slow rate here
+    default_slow_flow=1.0,     # rate through the last stretch
+    default_target=740.0,      # stop here
+)
+```
+
+All four numbers are the operator's, set from spin boxes at runtime; the declaration only supplies the starting values. Flow bounds are inherited from the setpoint control so the two can't disagree about what the MFC accepts. The boxes lock while a fill runs — changing the numbers a fill is running to would be ambiguous — and unlock when it ends.
+
+Why two stages: the MFC can't stop instantly and the vessel keeps rising after the valve shuts, so a single rate either creeps (slow everywhere) or overshoots (fast to the end).
+
+**This is the only part of the program that opens gas from a measurement rather than an operator's keystroke**, so most of its behaviour is about refusing to. Engaging is refused outright if there is no usable pressure reading, if the slow-down pressure isn't below the target, if the slow rate exceeds the fast rate or is zero, if the pressure is already at the target, or if the target is at or above the over-pressure alarm on the channels it steers by — that last one would trip the interlock at the top of every fill. `confirm=True` (the default) also names all four numbers and the current pressure in a dialog first.
+
+Once running it aborts to zero flow if **no trigger channel is readable** (filling blind is the thing it must never do), if the **interlock latches** the setpoint control, if the **shared bus dies**, or if the MFC rejects `INTERLOCK_MAX_ATTEMPTS` commands in a row. An abort is a fault: red LED, the reason on the box, and a line in the pinned fault summary.
+
+**Flow only ever ratchets down.** `fill_flow_for()` never returns more than the fill has already settled to, so pressure dithering across the handover can't swing the MFC between rates — and a fill whose pressure is *falling* (a leak, or someone pumping) is not a reason to open the valve wider.
+
+It steers by the **highest** reading among its pressure channels that is currently `OK`. Highest because two gauges disagreeing during a fill is a reason to believe the one saying you're closer to the target; `OK`-only because a switched-off low-range gauge is normal and must not veto a fill, while a stale or alarming one contributes nothing. It ticks once per scan, immediately after the interlocks see the same data, so a trip is found before one more command goes out.
+
+The decision logic (`fill_stage_for`, `fill_flow_for`, `fill_settings_error`) is pure and unit-tested in `tests/test_fill.py`.
 
 ### Safety interlocks
 

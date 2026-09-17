@@ -236,3 +236,54 @@ class SerialBus:
     led: object = None
     port_combo: object = None
     status_label: object = None
+
+
+@dataclass
+class FillControl:
+    """A two-stage automatic gas fill: open the MFC wide, then ease off before the
+    target so the vessel doesn't sail past it.
+
+    The MFC cannot stop instantly and the vessel keeps rising after the valve closes,
+    so a single-rate fill either creeps (slow everywhere) or overshoots (fast to the
+    end). Two rates with a handover pressure gets both: fast while there is room, slow
+    through the last stretch where overshoot would actually matter.
+
+    This is the only part of the program that commands gas from a measurement rather
+    than from an operator's keystroke, so its failure modes are the ones that matter:
+    it aborts to zero flow whenever the pressure it steers by stops being trustworthy,
+    and it never raises the flow it has already lowered."""
+    id: str
+    label: str
+    setpoint_control_id: str
+    pressure_channel_ids: list[str]
+    pressure_units: str
+    # Bounds for the operator's boxes; flow bounds are inherited from the setpoint
+    # control so the two can't disagree about what the MFC accepts.
+    max_pressure: float
+    pressure_decimals: int
+    default_fast_flow: float
+    default_slow_flow: float
+    default_slow_at: float
+    default_target: float
+    confirm: bool
+
+    # Runtime state.
+    # stage is 'idle' | 'fast' | 'slow' | 'done' | 'aborted'.
+    stage: str = 'idle'
+    engaged: bool = False
+    # What the MFC should be at right now, and what it last acknowledged. The tick
+    # closes the gap between them, so a command lost to a busy port or a transient
+    # error is simply re-sent next tick instead of needing its own retry bookkeeping.
+    desired_flow: float = 0.0
+    commanded_flow: float | None = None
+    failures: int = 0
+    detail: str = ''
+
+    box: object = None
+    led: object = None
+    fast_flow_spinbox: object = None
+    slow_flow_spinbox: object = None
+    slow_at_spinbox: object = None
+    target_spinbox: object = None
+    engage_button: object = None
+    status_label: object = None

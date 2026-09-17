@@ -206,6 +206,19 @@ pressure_tab.add_setpoint_control(id='setpoint_gas_inlet_mfc', label='Gas Inlet 
                                    min_value=0.0, max_value=50.0,
                                    decimals=2, default_value=0.0)
 
+#Automatic two-stage gas fill. The MFC cannot stop instantly and the vessel keeps
+#rising after the valve shuts, so a single rate either creeps or overshoots: this fills
+#fast while there is room, then eases to the slow rate for the last stretch where
+#overshoot matters. All four numbers are set by the operator at runtime; these are only
+#the starting values. It steers by the OV gauges and stops the moment they stop being
+#readable -- see "Automatic gas fill" in the README for what aborts it.
+plotter.add_fill_control(id='ov_gas_fill', label='OV Gas Fill',
+                          setpoint_control='setpoint_gas_inlet_mfc',
+                          pressure_channels=['ov_pressure_g1', 'ov_pressure_g2'],
+                          pressure_units='Torr', max_pressure=760.0, pressure_decimals=1,
+                          default_fast_flow=50.0, default_slow_flow=5.0,
+                          default_slow_at=675.0, default_target=750.0)
+
 '''SAFETY INTERLOCKS -- declared after the channels and the setpoint control they name,
 because every reference is validated here and a bad one raises at startup rather than
 arming an interlock that could never fire.'''

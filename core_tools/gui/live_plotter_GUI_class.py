@@ -14,7 +14,8 @@ import serial.tools.list_ports
 import json
 
 from .get_data_for_GUI import get_n_XY_datapoints
-from .models import Channel, Plot, LoggerControl, SetpointControl, SerialBus, Interlock, AggregateTile
+from .models import (Channel, Plot, LoggerControl, SetpointControl, SerialBus,
+                     Interlock, FillControl, AggregateTile)
 from .decimate import decimate_min_max
 from .data_cache import ScanRunnable
 from .palette import channel_palette
@@ -442,6 +443,61 @@ def interlock_reset_blockers(alarm_states):
     return blockers
 
 
+def fill_stage_for(pressure, slow_at, target):
+    """Which stage a fill should be in at this pressure: 'fast', 'slow' or 'done'.
+
+    Target is checked before the handover, so a reading that jumps straight past both
+    (a coarse logging interval, a pressure spike) finishes the fill rather than
+    dropping to the slow rate and carrying on filling past the target.
+
+    Boundaries are inclusive: at exactly the target the fill is done. Stopping a
+    fraction early is harmless; the vessel coasts up a little after the valve shuts
+    anyway. Continuing at exactly the target is not.
+    """
+    if pressure >= target:
+        return 'done'
+    if pressure >= slow_at:
+        return 'slow'
+    return 'fast'
+
+
+def fill_flow_for(stage, fast_flow, slow_flow, previous_flow=None):
+    """The flow a stage calls for, never higher than what the fill has already settled to.
+
+    The ratchet is deliberate. Pressure dithering across the handover threshold would
+    otherwise swing the MFC between the two rates, and a fill whose pressure is FALLING
+    means something is wrong -- a leak, or someone pumping -- which is not a reason to
+    open the valve wider. Once this fill has eased off, it only ever eases off further.
+    """
+    wanted = {'fast': fast_flow, 'slow': slow_flow, 'done': 0.0, 'aborted': 0.0}[stage]
+    if previous_flow is None:
+        return wanted
+    return min(wanted, previous_flow)
+
+
+def fill_settings_error(fast_flow, slow_flow, slow_at, target, pressure, alarm_limit):
+    """Why this fill must not start, or None if it may. Checked at the moment Engage is
+    pressed, against the values in the boxes and the pressure right now."""
+    if pressure is None:
+        return 'no usable pressure reading'
+    if slow_at >= target:
+        return (f'the slow-down pressure ({slow_at:g}) must be below the target '
+                f'({target:g}), or the slow stage never runs')
+    if slow_flow > fast_flow:
+        return f'the slow rate ({slow_flow:g}) must not exceed the fast rate ({fast_flow:g})'
+    if slow_flow <= 0:
+        return 'the slow rate must be above zero, or the fill can never reach its target'
+    if pressure >= target:
+        return f'already at or above the target ({pressure:g} >= {target:g})'
+    # An alarm limit on the pressure being filled is a hard ceiling: filling to or past
+    # it would trip the over-pressure interlock mid-fill, shut the gas and latch the
+    # setpoint control. Better to refuse now than to discover it at the top of a fill.
+    if alarm_limit is not None and target >= alarm_limit:
+        return (f'the target ({target:g}) is at or above the over-pressure alarm '
+                f'({alarm_limit:g}); the fill would trip the interlock')
+    return None
+
+
 def channels_fed_by(channels, log_filepath):
     """Ids of the channels a logger writing `log_filepath` feeds.
 
@@ -717,6 +773,10 @@ class LivePlotter:
         # ahead of the visual refresh: if an over-pressure is going to shut the gas,
         # the command should already be on its way by the time the banner appears.
         self.control_dock.handle_alarm_transitions(all_transitions)
+        # After the interlocks, deliberately: if this tick's data trips an over-pressure,
+        # the fill must find the setpoint control already latched and abort, rather than
+        # issuing one more command into a vessel that is over its limit.
+        self.control_dock.service_fill_controls()
 
         self._refresh_note_markers(now)
         self._refresh_alarm_visuals(now)
@@ -809,6 +869,20 @@ class LivePlotter:
     # -- each of those validates the reference and raises on a bad one.
     def add_serial_bus(self, id, label, script, port):
         return self.control_dock.add_serial_bus_group(id=id, label=label, script=script, port=port)
+
+    # Declared on the plotter, not on a tab: a fill drives one control from another
+    # subsystem's measurement, so it belongs to the system rather than to a display.
+    # Declare it AFTER the setpoint control and pressure channels it names.
+    def add_fill_control(self, id, label, setpoint_control, pressure_channels,
+                         pressure_units, max_pressure, default_fast_flow, default_slow_flow,
+                         default_slow_at, default_target, pressure_decimals=1, confirm=True):
+        return self.control_dock.add_fill_group(
+            id=id, label=label, setpoint_control_id=setpoint_control,
+            pressure_channel_ids=pressure_channels, pressure_units=pressure_units,
+            max_pressure=max_pressure, pressure_decimals=pressure_decimals,
+            default_fast_flow=default_fast_flow, default_slow_flow=default_slow_flow,
+            default_slow_at=default_slow_at, default_target=default_target, confirm=confirm,
+        )
 
     # Declared on the plotter, not on a tab: an interlock is a system-wide safety
     # rule, not part of any one tab's display. Declare it AFTER the setpoint control
@@ -1192,6 +1266,7 @@ class ControlDock(QtWidgets.QWidget):
         self.loggers = {}  # id -> LoggerControl
         self.setpoints = {}  # id -> SetpointControl
         self.interlocks = {}  # id -> Interlock
+        self.fills = {}  # id -> FillControl
         self.buses = {}  # id -> SerialBus
 
         self.layout = QtWidgets.QVBoxLayout()
@@ -1256,6 +1331,10 @@ class ControlDock(QtWidgets.QWidget):
         # kinds of action, and a Set button must never sit in the same visual block
         # as a Start/Stop that only affects what gets recorded.
         self.setpoints_layout = section()
+
+        # Between the setpoint control it drives and the interlock that can overrule
+        # it -- the order the three act in when a fill runs into an over-pressure.
+        self.fills_layout = section()
 
         # Below the control each one latches, so the trip state and the locked Set
         # button read as one thing.
@@ -1343,6 +1422,9 @@ class ControlDock(QtWidgets.QWidget):
         for logger in self.loggers.values():
             if logger.faulted:
                 faults.append((logger.label, logger.box))
+        for fill in self.fills.values():
+            if fill.stage == 'aborted':
+                faults.append((f'{fill.label} ABORTED', fill.box))
         for interlock in self.interlocks.values():
             if interlock.tripped:
                 faults.append((f'{interlock.label} TRIPPED', interlock.box))
@@ -2206,7 +2288,307 @@ class ControlDock(QtWidgets.QWidget):
         control.status_label.show()
 
         if source is not None and source != 'operator':
-            self._on_interlock_command_result(source, acknowledged, reply or error or f'exit code {exit_code}')
+            detail = reply or error or f'exit code {exit_code}'
+            if source in self.fills:
+                self._on_fill_command_result(source, acknowledged, value, detail)
+            else:
+                self._on_interlock_command_result(source, acknowledged, detail)
+
+    # Build one fill control's group box: the four numbers that define the fill, an
+    # Engage/Stop button, and a status line. Sits below the setpoint control it drives
+    # and above the interlock that can overrule it, which is the order they act in.
+    def add_fill_group(self, id, label, setpoint_control_id, pressure_channel_ids,
+                       pressure_units, max_pressure, pressure_decimals,
+                       default_fast_flow, default_slow_flow, default_slow_at,
+                       default_target, confirm):
+        if setpoint_control_id not in self.setpoints:
+            raise ValueError(f"fill control {id!r}: no setpoint control {setpoint_control_id!r} "
+                             f"(declare it first; known: {sorted(self.setpoints)})")
+        unknown = [c for c in pressure_channel_ids if c not in self.plotter.channels]
+        if unknown:
+            raise ValueError(f"fill control {id!r}: unknown pressure channel(s) {unknown} "
+                             f"(known: {sorted(self.plotter.channels)})")
+        if not pressure_channel_ids:
+            raise ValueError(f"fill control {id!r}: needs at least one pressure channel -- "
+                             f"it is the only thing that tells the fill when to stop")
+
+        control = self.setpoints[setpoint_control_id]
+        fill = FillControl(
+            id=id, label=label, setpoint_control_id=setpoint_control_id,
+            pressure_channel_ids=list(pressure_channel_ids), pressure_units=pressure_units,
+            max_pressure=max_pressure, pressure_decimals=pressure_decimals,
+            default_fast_flow=default_fast_flow, default_slow_flow=default_slow_flow,
+            default_slow_at=default_slow_at, default_target=default_target, confirm=confirm,
+        )
+
+        box = QtWidgets.QGroupBox(f'{label} (auto fill)')
+        box_layout = QtWidgets.QVBoxLayout()
+        box.setLayout(box_layout)
+
+        status_row = QtWidgets.QHBoxLayout()
+        led = QtWidgets.QLabel()
+        led.setFixedSize(12, 12)
+        fill.led = led
+        status_row.addWidget(led)
+        status_row.addWidget(QtWidgets.QLabel(label))
+        status_row.addStretch(1)
+        box_layout.addLayout(status_row)
+
+        # Laid out in the order the fill runs -- fast, then the handover, then slow,
+        # then the stop -- so reading the box top to bottom describes the sequence.
+        grid = QtWidgets.QGridLayout()
+
+        def row(n, text, spinbox):
+            grid.addWidget(QtWidgets.QLabel(text), n, 0)
+            grid.addWidget(spinbox, n, 1)
+
+        def flow_box(value):
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setDecimals(control.decimals)
+            spin.setRange(control.min_value, control.max_value)
+            spin.setValue(value)
+            spin.setSuffix(f' {control.units}')
+            return spin
+
+        def pressure_box(value):
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setDecimals(pressure_decimals)
+            spin.setRange(0.0, max_pressure)
+            spin.setValue(value)
+            spin.setSuffix(f' {pressure_units}')
+            return spin
+
+        fill.fast_flow_spinbox = flow_box(default_fast_flow)
+        fill.slow_at_spinbox = pressure_box(default_slow_at)
+        fill.slow_flow_spinbox = flow_box(default_slow_flow)
+        fill.target_spinbox = pressure_box(default_target)
+        row(0, 'Fast rate', fill.fast_flow_spinbox)
+        row(1, 'Slow down at', fill.slow_at_spinbox)
+        row(2, 'Slow rate', fill.slow_flow_spinbox)
+        row(3, 'Stop at', fill.target_spinbox)
+        box_layout.addLayout(grid)
+
+        status_label = QtWidgets.QLabel('')
+        status_label.setStyleSheet('font-size: 10px;')
+        status_label.setWordWrap(True)
+        fill.status_label = status_label
+        box_layout.addWidget(status_label)
+
+        engage_button = QtWidgets.QPushButton(f'Engage {label}')
+        engage_button.clicked.connect(lambda _, fid=id: self._toggle_fill(fid))
+        fill.engage_button = engage_button
+        box_layout.addWidget(engage_button)
+
+        fill.box = box
+        self.fills[id] = fill
+        self._refresh_fill(fill)
+        self.fills_layout.addWidget(box)
+        return fill
+
+    # The highest reading among the pressure channels that are currently trustworthy.
+    # Highest, because two gauges disagreeing during a fill is a reason to believe the
+    # one saying you are closer to the target. Channels that are not OK are skipped
+    # entirely -- a switched-off low-range gauge is normal and must not veto the fill,
+    # but a stale or alarming one contributes nothing either. None means no usable
+    # reading at all, which is the one condition a running fill cannot survive.
+    def _fill_pressure(self, fill):
+        readings = []
+        for channel_id in fill.pressure_channel_ids:
+            state = self.plotter.alarm_evaluator.state_for(channel_id)
+            if (state.state == AlarmState.OK and state.last_timestamp is not None
+                    and state.last_value is not None and not math.isnan(state.last_value)):
+                readings.append(state.last_value)
+        return max(readings) if readings else None
+
+    # The lowest over-pressure alarm limit among the channels this fill steers by --
+    # the ceiling a target must stay below, since crossing it trips the interlock.
+    def _fill_alarm_limit(self, fill):
+        limits = [self.plotter.channels[c].alarm.high
+                  for c in fill.pressure_channel_ids
+                  if self.plotter.channels[c].alarm is not None
+                  and self.plotter.channels[c].alarm.high is not None]
+        return min(limits) if limits else None
+
+    def _toggle_fill(self, fill_id):
+        fill = self.fills[fill_id]
+        if fill.engaged:
+            self._stop_fill(fill, 'stopped by the operator')
+        else:
+            self._engage_fill(fill)
+
+    def _engage_fill(self, fill):
+        control = self.setpoints[fill.setpoint_control_id]
+        if control.locked_by is not None:
+            interlock = self.interlocks.get(control.locked_by)
+            name = interlock.label if interlock is not None else control.locked_by
+            self._set_fill_status(fill, f'cannot start: {name} is tripped', ok=False)
+            self.plotter.log(f"[{fill.label}] refused: {name} is tripped", level='ERROR')
+            return
+
+        fast = fill.fast_flow_spinbox.value()
+        slow = fill.slow_flow_spinbox.value()
+        slow_at = fill.slow_at_spinbox.value()
+        target = fill.target_spinbox.value()
+        pressure = self._fill_pressure(fill)
+
+        problem = fill_settings_error(fast, slow, slow_at, target, pressure,
+                                      self._fill_alarm_limit(fill))
+        if problem:
+            self._set_fill_status(fill, f'cannot start: {problem}', ok=False)
+            self.plotter.log(f"[{fill.label}] refused: {problem}", level='ERROR')
+            return
+
+        if fill.confirm:
+            answer = QtWidgets.QMessageBox.question(
+                self, f'Engage {fill.label}',
+                f'Fill at {fast:g} {control.units} until {slow_at:g} {fill.pressure_units}, '
+                f'then {slow:g} {control.units} until {target:g} {fill.pressure_units}?\n\n'
+                f'{control.label} is at {pressure:g} {fill.pressure_units} now. '
+                f'This opens gas automatically.',
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel)
+            if answer != QtWidgets.QMessageBox.Yes:
+                self.plotter.log(f"[{fill.label}] engage cancelled", level='INFO')
+                return
+
+        fill.engaged = True
+        fill.stage = 'fast'
+        fill.desired_flow = fast
+        fill.commanded_flow = None  # nothing acknowledged for this fill yet
+        fill.failures = 0
+        fill.engage_button.setText(f'STOP {fill.label}')
+        fill.engage_button.setStyleSheet("background-color: red;")
+        for spin in (fill.fast_flow_spinbox, fill.slow_flow_spinbox,
+                     fill.slow_at_spinbox, fill.target_spinbox):
+            spin.setEnabled(False)  # the fill is running to these numbers; changing them mid-fill would be ambiguous
+        self.plotter.log(f"[{fill.label}] ENGAGED: {fast:g} {control.units} to "
+                         f"{slow_at:g} {fill.pressure_units}, then {slow:g} {control.units} "
+                         f"to {target:g} {fill.pressure_units} (now {pressure:g})", level='ALARM')
+        self._service_fill(fill)
+        self._refresh_fill(fill)
+
+    def _stop_fill(self, fill, reason, stage='idle'):
+        fill.engaged = False
+        fill.stage = stage
+        fill.desired_flow = 0.0
+        fill.detail = reason
+        fill.engage_button.setText(f'Engage {fill.label}')
+        fill.engage_button.setStyleSheet('')
+        for spin in (fill.fast_flow_spinbox, fill.slow_flow_spinbox,
+                     fill.slow_at_spinbox, fill.target_spinbox):
+            spin.setEnabled(True)
+        level = 'ALARM' if stage == 'aborted' else 'INFO'
+        self.plotter.log(f"[{fill.label}] {reason} -- closing to 0 {self.setpoints[fill.setpoint_control_id].units}",
+                         level=level)
+        self._push_fill_flow(fill)  # get the valve shut before anything else happens
+        self._refresh_fill(fill)
+
+    # Called once per scan tick, when fresh pressure has just arrived.
+    def service_fill_controls(self):
+        for fill in self.fills.values():
+            if fill.engaged:
+                self._service_fill(fill)
+            elif fill.desired_flow and fill.commanded_flow != fill.desired_flow:
+                self._push_fill_flow(fill)   # a stop whose command hasn't landed yet
+            self._refresh_fill(fill)
+
+    def _service_fill(self, fill):
+        control = self.setpoints[fill.setpoint_control_id]
+
+        # The interlock outranks the fill; if it has latched the control, this fill is
+        # over. Checked first so a trip can't be papered over by the next command.
+        if control.locked_by is not None:
+            interlock = self.interlocks.get(control.locked_by)
+            name = interlock.label if interlock is not None else control.locked_by
+            self._stop_fill(fill, f'ABORTED: {name} tripped', stage='aborted')
+            return
+
+        pressure = self._fill_pressure(fill)
+        if pressure is None:
+            # Filling on a pressure nobody can read is the thing this must never do.
+            self._stop_fill(fill, 'ABORTED: no usable pressure reading', stage='aborted')
+            return
+
+        stage = fill_stage_for(pressure, fill.slow_at_spinbox.value(), fill.target_spinbox.value())
+        if stage == 'done':
+            fill.stage = 'done'
+            self._stop_fill(fill, f'target reached at {pressure:g} {fill.pressure_units}', stage='done')
+            return
+
+        if stage != fill.stage:
+            self.plotter.log(f"[{fill.label}] {pressure:g} {fill.pressure_units} -- "
+                             f"{fill.stage} -> {stage} rate", level='INFO')
+            fill.stage = stage
+        fill.desired_flow = fill_flow_for(stage, fill.fast_flow_spinbox.value(),
+                                          fill.slow_flow_spinbox.value(), fill.desired_flow)
+        self._push_fill_flow(fill)
+
+    # Closes the gap between what the fill wants and what the MFC last acknowledged.
+    # Re-sending on the next tick is the whole retry mechanism: a command lost to a
+    # busy port or a one-off error simply goes again a second later.
+    def _push_fill_flow(self, fill):
+        control = self.setpoints[fill.setpoint_control_id]
+        if fill.commanded_flow == fill.desired_flow or control.sending:
+            return
+        if control.locked_by is not None and fill.desired_flow:
+            return  # locked and we want flow: the interlock check will end this fill
+        if fill.failures >= INTERLOCK_MAX_ATTEMPTS:
+            return
+        self._dispatch_setpoint(control, fill.desired_flow, source=fill.id)
+
+    def _on_fill_command_result(self, fill_id, acknowledged, value, detail):
+        fill = self.fills.get(fill_id)
+        if fill is None:
+            return
+        if acknowledged:
+            fill.commanded_flow = value
+            fill.failures = 0
+            # The MFC is at this value now, so the setpoint box has to read it too --
+            # the operator isn't typing in that box during an automatic fill, and
+            # leaving it on a stale number would misstate the hardware. Same reasoning
+            # as the interlock syncing it to the safe value on a trip.
+            self.setpoints[fill.setpoint_control_id].value_spinbox.setValue(value)
+        else:
+            fill.failures += 1
+            self.plotter.log(f"[{fill.label}] attempt {fill.failures} of {INTERLOCK_MAX_ATTEMPTS} "
+                             f"to set {value:g} failed ({detail})", level='ALARM')
+            if fill.failures >= INTERLOCK_MAX_ATTEMPTS:
+                if fill.engaged:
+                    self._stop_fill(fill, 'ABORTED: cannot command the MFC', stage='aborted')
+                else:
+                    self.plotter.log(f"[{fill.label}] COULD NOT CLOSE THE MFC after "
+                                     f"{INTERLOCK_MAX_ATTEMPTS} attempts -- SHUT THE GAS MANUALLY",
+                                     level='ALARM')
+        self._refresh_fill(fill)
+
+    def _set_fill_status(self, fill, text, ok=True):
+        color = '#2ecc71' if ok else ALARM_COLOR
+        weight = '' if ok else 'font-weight: bold; '
+        fill.status_label.setStyleSheet(f'color: {color}; {weight}font-size: 10px;')
+        fill.status_label.setText(text)
+
+    def _refresh_fill(self, fill):
+        control = self.setpoints[fill.setpoint_control_id]
+        pressure = self._fill_pressure(fill)
+        reading = f'{pressure:g} {fill.pressure_units}' if pressure is not None else 'no reading'
+
+        if fill.engaged:
+            self._set_led(fill, 'sending' if fill.stage == 'fast' else 'running')
+            self._set_fill_status(
+                fill, f'{fill.stage.upper()} at {fill.desired_flow:g} {control.units} — '
+                      f'{reading}, stopping at {fill.target_spinbox.value():g} {fill.pressure_units}')
+            return
+
+        if fill.stage == 'aborted' or fill.failures >= INTERLOCK_MAX_ATTEMPTS:
+            self._set_led(fill, 'crashed')
+            self._set_fill_status(fill, fill.detail or 'aborted', ok=False)
+        elif fill.stage == 'done':
+            self._set_led(fill, 'running')
+            self._set_fill_status(fill, fill.detail or 'target reached')
+        else:
+            self._set_led(fill, 'stopped')
+            fill.status_label.setStyleSheet('font-size: 10px; color: #7f8c8d;')
+            fill.status_label.setText(fill.detail or f'Idle — {reading}')
 
     # Build one interlock's group box: LED, what it watches and what it does, a live
     # status line, and a Reset button that stays disabled until a reset is actually
@@ -2322,6 +2704,9 @@ class ControlDock(QtWidgets.QWidget):
         # by the time anyone can click it.
         control.locked_by = interlock.id
         control.send_button.setEnabled(False)
+        for fill in list(self.fills.values()):
+            if fill.engaged and fill.setpoint_control_id == control.id:
+                self._stop_fill(fill, f'ABORTED: {interlock.label} tripped', stage='aborted')
         # A greyed-out button with no explanation is its own failure mode -- the one
         # moment the operator most needs to know why they can't command flow.
         control.send_button.setToolTip(f'Locked: {interlock.label} interlock is tripped. '
@@ -2495,6 +2880,10 @@ class ControlDock(QtWidgets.QWidget):
                 self._set_led(logger, 'crashed')
                 logger.error_label.setText(f'shared port closed (exit {exit_code}): {last_line}')
                 logger.error_label.show()
+
+        for fill in list(self.fills.values()):
+            if fill.engaged and self.setpoints[fill.setpoint_control_id].bus_id == bus.id:
+                self._stop_fill(fill, 'ABORTED: shared port closed', stage='aborted')
 
         # An in-flight setpoint on a dead bus will never be answered; fail it now so
         # the control is usable again and a tripped interlock can retry.
