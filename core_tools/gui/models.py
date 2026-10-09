@@ -82,6 +82,12 @@ class LoggerControl:
     bus_id: str | None = None
     unit_id: str | None = None
     unit_type: str | None = None
+    # Restart this logger by itself after an unexpected exit, instead of leaving it
+    # stopped until someone presses Start. For an instrument whose log feeds a safety
+    # interlock, a stopped logger is a stale channel and a tripped interlock -- so one
+    # malformed reply from the instrument shouldn't be able to stop logging for good.
+    # Standalone loggers only: a bus logger's process is the bus's.
+    auto_restart: bool = False
 
     # Runtime state, populated by ControlDock.add_logger_group() and mutated as it runs.
     process: object = None
@@ -94,6 +100,13 @@ class LoggerControl:
     # goes red -- the same reasoning as AlarmSpec.consecutive_samples.
     poll_errors: int = 0
     last_poll_error: str = ''
+    # auto_restart bookkeeping. restart_at is when the pending restart is due (None when
+    # none is pending); consecutive_crashes counts exits that came too soon after the
+    # previous start to call the logger healthy, and sets how long to wait before the
+    # next try. started_at is what tells those apart.
+    restart_at: float | None = None
+    consecutive_crashes: int = 0
+    started_at: float | None = None
     # Set when this control has stopped because something went wrong, cleared when it
     # is started or stopped deliberately. The dock scrolls, so a red LED can be off
     # screen -- this is what the pinned fault summary counts.
@@ -170,6 +183,13 @@ class Interlock:
     setpoint_control_id: str
     safe_value: float
     trip_on_stale: bool = True
+    # Reset by itself once readings resume, but ONLY when the trip was caused by the
+    # channel going STALE. A stale trip means "the readings stopped arriving" -- a dead
+    # or restarted logger, a malformed reply from the instrument -- not "the pressure is
+    # high", and once good readings are back there is nothing left for a person to
+    # judge. A trip caused by ALARM always needs a person, and so does a stale trip
+    # that sees an ALARM before it resets (see trip_cause).
+    auto_reset_after_stale: bool = False
 
     # Runtime state, populated by ControlDock.add_interlock_group() and mutated as it
     # trips and is reset.
@@ -186,6 +206,13 @@ class Interlock:
     tripped: bool = False
     trip_reason: str = ''
     trip_timestamp: float | None = None
+    # 'alarm' or 'stale': what tripped it, which decides whether it may reset itself.
+    # One-way from 'stale' to 'alarm' -- an over-pressure seen while tripped makes it a
+    # manual reset, however the trip began.
+    trip_cause: str = ''
+    # When every trigger channel was last seen to become good while tripped, for
+    # auto_reset_after_stale. None while anything still blocks the reset.
+    good_since: float | None = None
     # Whether the safe-value command was actually acknowledged by the controller.
     # Tripped-but-unconfirmed is the dangerous state: the interlock fired but the gas
     # may still be flowing, so it is retried and shown in red until it lands.

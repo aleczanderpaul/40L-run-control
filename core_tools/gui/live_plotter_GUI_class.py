@@ -52,6 +52,19 @@ SETPOINT_TIMEOUT_S = 15
 INTERLOCK_RETRY_DELAY_S = 2.0
 INTERLOCK_MAX_ATTEMPTS = 5
 
+# A logger declared with auto_restart is restarted this long after it exits
+# unexpectedly. Short enough that a one-off bad reply from the instrument is over
+# before the channel goes STALE (stale_multiplier x interval = 10s at 2s logging), so
+# the interlock never sees it; long enough that a process dying on a bad port doesn't
+# spin. After LOGGER_FAST_RESTARTS crashes in a row it slows to the second delay --
+# but never gives up, because for a channel guarding a vessel "stopped trying" is the
+# state this exists to get out of. A logger that ran LOGGER_HEALTHY_RUN_S before it
+# exited counts as healthy, so its next crash starts the count over.
+LOGGER_RESTART_DELAY_S = 3.0
+LOGGER_SLOW_RESTART_DELAY_S = 30.0
+LOGGER_FAST_RESTARTS = 5
+LOGGER_HEALTHY_RUN_S = 60.0
+
 # How many consecutive rejected frames a bus unit may have before its control goes
 # red. Frame errors (a mis-addressed reply, a short read) are usually transient and
 # the next poll clears them; a port failure is not debounced at all, because a port
@@ -441,6 +454,53 @@ def interlock_reset_blockers(alarm_states):
         elif state.state == AlarmState.NO_DATA and not any_reading:
             blockers.append((channel_id, state.state.value))
     return blockers
+
+
+def interlock_auto_reset_blockers(alarm_states):
+    """What stops an interlock resetting *itself*, as [(channel_id, reason)].
+
+    Everything that blocks a manual reset, plus any channel whose newest readings are
+    over its limit but not yet enough of them to have entered ALARM. A person pressing
+    Reset can see the number; an automatic reset can't, and the channel coming back
+    from STALE restarts its debounce from zero -- so without this, a vessel that came
+    back over-pressure would be unlocked for the few seconds it takes the alarm to fire.
+    """
+    blockers = interlock_reset_blockers(alarm_states)
+    blocked = {channel_id for channel_id, _ in blockers}
+    for channel_id, state in alarm_states.items():
+        if channel_id not in blocked and state.state == AlarmState.OK and state.consecutive_breach > 0:
+            blockers.append((channel_id, 'over limit'))
+    return blockers
+
+
+def interlock_auto_reset_due(interlock, blockers, now, hold_s):
+    """Should this tripped interlock reset itself now? Advances interlock.good_since.
+
+    Only a trip caused by STALE data, on an interlock declared auto_reset_after_stale,
+    and only once its safe-value command has been confirmed -- an unconfirmed or
+    abandoned command means the gas may still be flowing, which is for a person to
+    sort out, and resetting would hide the SHUT THE GAS MANUALLY warning.
+
+    The readings must then stay good for hold_s without a break: long enough for an
+    over-pressure to debounce into ALARM (which turns this into a manual reset) rather
+    than be reset over on the first good-looking sample.
+    """
+    if (not interlock.tripped or interlock.trip_cause != 'stale'
+            or not interlock.auto_reset_after_stale):
+        return False
+    if blockers or not interlock.command_confirmed:
+        interlock.good_since = None
+        return False
+    if interlock.good_since is None:
+        interlock.good_since = now
+    return now - interlock.good_since >= hold_s
+
+
+def logger_restart_delay(consecutive_crashes):
+    """Seconds to wait before restarting a logger that has crashed this many times in a row."""
+    if consecutive_crashes <= LOGGER_FAST_RESTARTS:
+        return LOGGER_RESTART_DELAY_S
+    return LOGGER_SLOW_RESTART_DELAY_S
 
 
 def fill_stage_for(pressure, slow_at, target):
@@ -888,11 +948,12 @@ class LivePlotter:
     # rule, not part of any one tab's display. Declare it AFTER the setpoint control
     # and the trigger channels it names -- it validates every reference immediately
     # and raises rather than arming an interlock that could never fire.
-    def add_interlock(self, id, label, trigger_channels, setpoint_control, safe_value, trip_on_stale=True):
+    def add_interlock(self, id, label, trigger_channels, setpoint_control, safe_value, trip_on_stale=True,
+                      auto_reset_after_stale=False):
         return self.control_dock.add_interlock_group(
             id=id, label=label, trigger_channel_ids=trigger_channels,
             setpoint_control_id=setpoint_control, safe_value=safe_value,
-            trip_on_stale=trip_on_stale,
+            trip_on_stale=trip_on_stale, auto_reset_after_stale=auto_reset_after_stale,
         )
 
     def create_tab(self, tab_name, plots_per_row):
@@ -1222,11 +1283,12 @@ class LiveTab(QtWidgets.QWidget):
     # control dock -- see ControlDock.add_logger_group for what this actually builds.
     def add_logger_control(self, id, label, log_filepath, interval_options, default_interval,
                            script=None, port=None, extra_args=None, bus=None,
-                           unit_id=None, unit_type=None):
+                           unit_id=None, unit_type=None, auto_restart=False):
         return self.plotter.control_dock.add_logger_group(
             id=id, label=label, script=script, log_filepath=log_filepath, port=port,
             interval_options=interval_options, default_interval=default_interval,
             extra_args=extra_args, bus_id=bus, unit_id=unit_id, unit_type=unit_type,
+            auto_restart=auto_restart,
         )
 
     # Register an Alicat MFC setpoint control (LED, port, value box, Set) in the same
@@ -1421,7 +1483,8 @@ class ControlDock(QtWidgets.QWidget):
                 faults.append((f'{bus.label} port', bus.box))
         for logger in self.loggers.values():
             if logger.faulted:
-                faults.append((logger.label, logger.box))
+                name = f'{logger.label} (restarting)' if logger.restart_at is not None else logger.label
+                faults.append((name, logger.box))
         for fill in self.fills.values():
             if fill.stage == 'aborted':
                 faults.append((f'{fill.label} ABORTED', fill.box))
@@ -1800,16 +1863,19 @@ class ControlDock(QtWidgets.QWidget):
     # and a hidden error line that appears only on an unexpected exit.
     def add_logger_group(self, id, label, log_filepath, interval_options, default_interval,
                          script=None, port=None, extra_args=None, bus_id=None,
-                         unit_id=None, unit_type=None):
+                         unit_id=None, unit_type=None, auto_restart=False):
         _check_transport('logger', id, bus_id, self.buses, script, port)
         if bus_id is not None and (unit_id is None or unit_type is None):
             raise ValueError(f"logger {id!r}: a bus logger needs unit_id and unit_type "
                              f"-- they are how the bus knows which instrument to poll")
+        if bus_id is not None and auto_restart:
+            raise ValueError(f"logger {id!r}: auto_restart applies to a logger's own subprocess, "
+                             f"and a bus logger has none -- the bus owns the process")
         logger = LoggerControl(
             id=id, label=label, script=script, log_filepath=log_filepath,
             interval_options=interval_options, default_interval=default_interval, port=port,
             extra_args=[str(a) for a in (extra_args or [])],
-            bus_id=bus_id, unit_id=unit_id, unit_type=unit_type,
+            bus_id=bus_id, unit_id=unit_id, unit_type=unit_type, auto_restart=auto_restart,
         )
 
         box = QtWidgets.QGroupBox(label)
@@ -1898,14 +1964,21 @@ class ControlDock(QtWidgets.QWidget):
         else:
             logger.pending_interval = None
 
+    # A logger waiting out an auto-restart delay still shows Stop: the operator's
+    # intent is "logging", and pressing Stop is how they cancel the restart.
     def _toggle_logger(self, logger_id):
         logger = self.loggers[logger_id]
-        if logger.running:
+        if logger.running or logger.restart_at is not None:
             self._stop_logger(logger)
         else:
             self._start_logger(logger)
 
-    def _start_logger(self, logger):
+    # `automatic` is an auto_restart after a crash; anything else is an operator
+    # pressing Start, which begins a fresh crash count.
+    def _start_logger(self, logger, automatic=False):
+        logger.restart_at = None
+        if not automatic:
+            logger.consecutive_crashes = 0
         interval = logger.pending_interval if logger.pending_interval is not None else logger.interval_combo.currentData()
         if logger.bus_id is not None:
             self._start_bus_logger(logger, interval)
@@ -1934,13 +2007,15 @@ class ControlDock(QtWidgets.QWidget):
 
         logger.running = True
         logger.faulted = False
+        logger.started_at = time.time()
         self._apply_log_interval(logger, interval)
         logger.start_stop_button.setText(f'Stop {logger.label}')
         logger.start_stop_button.setStyleSheet("background-color: red;")
         logger.error_label.hide()
         self._set_led(logger, 'running')
         extras = f", {' '.join(logger.extra_args)}" if logger.extra_args else ''
-        self.plotter.log(f"Started logger: {logger.label} ({port}{extras}, {interval}s)", level='INFO')
+        verb = 'Restarted' if automatic else 'Started'
+        self.plotter.log(f"{verb} logger: {logger.label} ({port}{extras}, {interval}s)", level='INFO')
 
     # A bus logger has no subprocess of its own: it acquires the shared port and
     # becomes one polled unit on it. Everything the operator sees -- LED, button,
@@ -2000,6 +2075,7 @@ class ControlDock(QtWidgets.QWidget):
 
     def _stop_logger(self, logger):
         logger.user_stopped = True
+        logger.restart_at = None
         if logger.bus_id is not None:
             bus = self.buses[logger.bus_id]
             self._send_bus(bus, {'cmd': 'stop', 'unit_id': logger.unit_id})
@@ -2044,6 +2120,29 @@ class ControlDock(QtWidgets.QWidget):
                     logger.error_label.setText(f'exit code {exit_code}: {last_line}')
                     logger.error_label.show()
                     self.plotter.log(f"Logger {logger.label} exited unexpectedly (code {exit_code}): {last_line}", level='ERROR')
+                    if logger.auto_restart:
+                        self._schedule_logger_restart(logger)
+        self._service_logger_restarts()
+
+    def _schedule_logger_restart(self, logger):
+        now = time.time()
+        ran_for = now - logger.started_at if logger.started_at is not None else 0.0
+        logger.consecutive_crashes = 1 if ran_for >= LOGGER_HEALTHY_RUN_S else logger.consecutive_crashes + 1
+        delay = logger_restart_delay(logger.consecutive_crashes)
+        logger.restart_at = now + delay
+        # Still reads Stop while the restart is pending -- see _toggle_logger.
+        logger.start_stop_button.setText(f'Stop {logger.label}')
+        logger.start_stop_button.setStyleSheet("background-color: red;")
+        logger.error_label.setText(f'{logger.error_label.text()} -- restarting in {delay:g}s '
+                                   f'(crash {logger.consecutive_crashes} in a row)')
+        self.plotter.log(f"Logger {logger.label} will restart in {delay:g}s "
+                         f"(crash {logger.consecutive_crashes} in a row)", level='ERROR')
+
+    def _service_logger_restarts(self):
+        now = time.time()
+        for logger in self.loggers.values():
+            if logger.restart_at is not None and now >= logger.restart_at:
+                self._start_logger(logger, automatic=True)
 
     # Build one MFC setpoint control's group box: LED, port dropdown, a bounded value
     # box in the controller's engineering units, and a Set button. There is no
@@ -2594,7 +2693,7 @@ class ControlDock(QtWidgets.QWidget):
     # status line, and a Reset button that stays disabled until a reset is actually
     # allowed. Deliberately the last block in the dock, under the control it latches.
     def add_interlock_group(self, id, label, trigger_channel_ids, setpoint_control_id,
-                            safe_value, trip_on_stale):
+                            safe_value, trip_on_stale, auto_reset_after_stale=False):
         # Fail at startup, not silently at trip time. A typo in a channel id or a
         # control id would otherwise produce an interlock that looks armed in the GUI
         # and does nothing when the pressure actually rises -- the single worst
@@ -2614,7 +2713,7 @@ class ControlDock(QtWidgets.QWidget):
         interlock = Interlock(
             id=id, label=label, trigger_channel_ids=list(trigger_channel_ids),
             setpoint_control_id=setpoint_control_id, safe_value=safe_value,
-            trip_on_stale=trip_on_stale,
+            trip_on_stale=trip_on_stale, auto_reset_after_stale=auto_reset_after_stale,
         )
 
         control = self.setpoints[setpoint_control_id]
@@ -2672,12 +2771,27 @@ class ControlDock(QtWidgets.QWidget):
             return
         for interlock in self.interlocks.values():
             self._update_armed(interlock)
-            if interlock.tripped or not interlock.armed:
-                continue  # already tripped (a second trigger changes nothing), or not yet armed
-            for transition in transitions:
-                if interlock_should_trip(transition, interlock.trigger_channel_ids, interlock.trip_on_stale):
-                    self._trip_interlock(interlock, transition.message)
-                    break
+            if interlock.tripped:
+                # A second trigger changes nothing about the gas -- it's already at the
+                # safe value -- but an over-pressure seen during a stale trip changes
+                # who may reset it: that is now a person's call.
+                if interlock.trip_cause == 'stale':
+                    for transition in transitions:
+                        if (transition.channel_id in interlock.trigger_channel_ids
+                                and transition.to_state == AlarmState.ALARM):
+                            self._escalate_interlock(interlock, transition.message)
+                            break
+                continue
+            if not interlock.armed:
+                continue
+            tripping = [t for t in transitions
+                        if interlock_should_trip(t, interlock.trigger_channel_ids, interlock.trip_on_stale)]
+            if tripping:
+                # An ALARM in the same batch as a STALE decides the cause -- otherwise
+                # an over-pressure could ride in on a trip that resets itself.
+                alarms = [t for t in tripping if t.to_state == AlarmState.ALARM]
+                first = (alarms or tripping)[0]
+                self._trip_interlock(interlock, first.message, 'alarm' if alarms else 'stale')
 
     # Arms on the first tick where the vessel's pressure is readable. That is the same
     # predicate a reset uses -- "the pressure is knowable right now" is exactly what
@@ -2689,10 +2803,12 @@ class ControlDock(QtWidgets.QWidget):
         self.plotter.log(f"INTERLOCK {interlock.label} armed", level='INFO')
         self._refresh_interlock(interlock)
 
-    def _trip_interlock(self, interlock, reason):
+    def _trip_interlock(self, interlock, reason, cause):
         control = self.setpoints[interlock.setpoint_control_id]
         interlock.tripped = True
         interlock.trip_reason = reason
+        interlock.trip_cause = cause
+        interlock.good_since = None
         interlock.trip_timestamp = time.time()
         interlock.command_confirmed = False
         interlock.attempts = 0
@@ -2716,6 +2832,28 @@ class ControlDock(QtWidgets.QWidget):
                          f"{control.label} to {interlock.safe_value:g} {control.units}", level='ALARM')
         self._attempt_interlock_command(interlock)
         self._refresh_interlock(interlock)
+
+    def _escalate_interlock(self, interlock, reason):
+        interlock.trip_cause = 'alarm'
+        interlock.trip_reason = f'{interlock.trip_reason}; then {reason}'
+        interlock.good_since = None
+        self.plotter.log(f"INTERLOCK {interlock.label}: over-pressure while tripped ({reason}) -- "
+                         f"will not reset automatically, manual reset required", level='ALARM')
+        self._refresh_interlock(interlock)
+
+    # How long the readings must stay good before a stale trip resets itself: as long
+    # as the slowest trigger channel's alarm takes to debounce, so an over-pressure that
+    # came back with the data gets the chance to show up as ALARM first.
+    def _auto_reset_hold_s(self, interlock):
+        return max(self.plotter.channels[c].alarm.consecutive_samples * self.plotter.channels[c].log_interval_s
+                   for c in interlock.trigger_channel_ids)
+
+    def _service_auto_reset(self, interlock, now):
+        states = {channel_id: self.plotter.alarm_evaluator.state_for(channel_id)
+                  for channel_id in interlock.trigger_channel_ids}
+        if interlock_auto_reset_due(interlock, interlock_auto_reset_blockers(states), now,
+                                    self._auto_reset_hold_s(interlock)):
+            self._reset_interlock(interlock.id, automatic=True)
 
     def _attempt_interlock_command(self, interlock):
         control = self.setpoints[interlock.setpoint_control_id]
@@ -2767,6 +2905,7 @@ class ControlDock(QtWidgets.QWidget):
                     and interlock.next_attempt_time is not None and now >= interlock.next_attempt_time):
                 interlock.next_attempt_time = None
                 self._attempt_interlock_command(interlock)
+            self._service_auto_reset(interlock, now)
             self._refresh_interlock(interlock)
 
     # A reset is allowed once the vessel's pressure is readable again -- see
@@ -2778,7 +2917,7 @@ class ControlDock(QtWidgets.QWidget):
         return [(self.plotter.channels[channel_id].label, reason)
                 for channel_id, reason in interlock_reset_blockers(states)]
 
-    def _reset_interlock(self, interlock_id):
+    def _reset_interlock(self, interlock_id, automatic=False):
         interlock = self.interlocks[interlock_id]
         if not interlock.tripped:
             return
@@ -2796,6 +2935,8 @@ class ControlDock(QtWidgets.QWidget):
         interlock.attempts = 0
         interlock.next_attempt_time = None
         interlock.trip_reason = ''
+        interlock.trip_cause = ''
+        interlock.good_since = None
         interlock.trip_timestamp = None
 
         control.locked_by = None
@@ -2804,7 +2945,8 @@ class ControlDock(QtWidgets.QWidget):
         # Reset unlocks the control; it deliberately does NOT restore the setpoint
         # that was in force before the trip. Flow only ever resumes because someone
         # typed a value and pressed Set.
-        self.plotter.log(f"INTERLOCK {interlock.label} reset -- {control.label} re-enabled "
+        how = 'reset automatically after readings resumed' if automatic else 'reset'
+        self.plotter.log(f"INTERLOCK {interlock.label} {how} -- {control.label} re-enabled "
                          f"(still at {interlock.safe_value:g} {control.units})", level='INFO')
         self._refresh_interlock(interlock)
 
@@ -2848,6 +2990,20 @@ class ControlDock(QtWidgets.QWidget):
                 f'TRIPPED {tripped_at} — {interlock.trip_reason}. Setting {control.label} to '
                 f'{interlock.safe_value:g} {control.units} (attempt {max(interlock.attempts, 1)} of '
                 f'{INTERLOCK_MAX_ATTEMPTS})…')
+
+        if interlock.trip_cause == 'stale' and interlock.auto_reset_after_stale:
+            if not interlock.command_confirmed:
+                note = 'Will not reset automatically until the safe value is confirmed.'
+            elif interlock.good_since is not None:
+                note = 'Readings resumed; resetting automatically if they stay good.'
+            else:
+                note = 'Resets automatically once readings resume.'
+        elif interlock.trip_cause == 'alarm':
+            note = 'Over-pressure: manual reset required.'
+        else:
+            note = ''
+        if note:
+            interlock.status_label.setText(f'{interlock.status_label.text()} {note}')
 
         blocking = self._blocking_channels(interlock)
         interlock.reset_button.setEnabled(not blocking)
@@ -2898,6 +3054,7 @@ class ControlDock(QtWidgets.QWidget):
             self._stop_bus(bus)
         for logger in self.loggers.values():
             logger.user_stopped = True
+            logger.restart_at = None
             if logger.bus_id is None:
                 self._kill(logger.process)
         # In-flight setpoint commands are deliberately NOT killed: they are bounded by

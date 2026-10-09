@@ -168,9 +168,13 @@ pressure_tab.add_plot(plot_id='filter_line_h2o', title=filter_line_H2O_plot_titl
 
 #pressure tab controls
 log_interval_options = [('2s', 2), ('10s', 10), ('1m', 60), ('10m', 600), ('1hr', 3600)]
+#auto_restart: a malformed reply from the PDR 2000 console kills this logger, and a
+#stopped OV logger means a stale channel and a tripped interlock. Restarted ~3s after
+#a crash, a one-off bad reply is over before the channel would go stale.
 pressure_tab.add_logger_control(id='log_ov_pressure', label='OV Pressure', script='log_pressure.py',
                                  log_filepath=outer_vessel_pressure_log_filepath, port='COM3',
-                                 interval_options=log_interval_options, default_interval=2)
+                                 interval_options=log_interval_options, default_interval=2,
+                                 auto_restart=True)
 pressure_tab.add_logger_control(id='log_h2o', label='H2O Concentration', script='log_H2O_readings.py',
                                  log_filepath=vaisala_H2O_log_filepath, port='COM5',
                                  interval_options=log_interval_options, default_interval=2)
@@ -229,10 +233,14 @@ arming an interlock that could never fire.'''
 #breach rather than on a single noisy sample. trip_on_stale also shuts the gas when
 #the OV reading stops arriving at all: gas flowing into a vessel whose pressure
 #nobody is watching is the case this exists to prevent.
+#auto_reset_after_stale: a trip caused ONLY by readings stopping (e.g. the logger died
+#on a bad reply from the console and was auto-restarted) resets itself once good
+#readings have been back for a full debounce window. A trip caused by over-pressure --
+#or a stale trip that sees an over-pressure before it resets -- still needs a person.
 plotter.add_interlock(id='ov_overpressure_stops_gas', label='OV Over-pressure',
                        trigger_channels=['ov_pressure_g1', 'ov_pressure_g2'],
                        setpoint_control='setpoint_gas_inlet_mfc',
-                       safe_value=0.0, trip_on_stale=True)
+                       safe_value=0.0, trip_on_stale=True, auto_reset_after_stale=True)
 
 '''VMM TEMPERATURES TAB -- tile grid + one overlay plot (§5.4), not 16 separate plots'''
 vmm_plot_ids = [f'vmm_temp_{i}' for i in range(num_vmms)]
